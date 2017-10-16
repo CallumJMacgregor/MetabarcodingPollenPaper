@@ -1,0 +1,2805 @@
+---
+title: "Analysis of networks"
+author: "C.J. Macgregor"
+date: "15 November 2016"
+output: html_notebook # note that pdf output requires a full installation of TeX
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width=87)
+```
+
+# Analysis of metabarcoding and microscopy networks
+
+We have collected interaction data from paired samples of moths; one sample by traditional microscopy-based identification and the other by DNA metabarcoding. For each sample we want to produce some summary statistics including an ecological network to report.
+
+## Prepare the environment
+
+Clear the workspace, make a list of required packages, check for any that aren't yet installed, install them, and then load up all required packages.
+
+```{r prepare_environment, warning=FALSE}
+rm(list=ls())
+j <- c("reshape2","ggplot2","rmarkdown","plyr","bipartite","vegan","lme4","glmmADMB","MASS","car","scales","AICcmodavg","effects","gridExtra")
+
+new.packages <- j[!(j %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, repos = "http://star-www.st-andrews.ac.uk/cran/")
+
+lapply(j, require, character.only = TRUE)
+```
+Load up Callum's custom functions, for calculating interaction completeness and plotting model residuals, and one sourced from elsewhere for multiplots:
+
+```{r load_function}
+f <- c("SpecAccumFunctions.R","CheckResidsFunction.R","MultiplotFunction.R","NetworkBootstrapFunction.R")
+lapply(f, source)
+```
+
+
+For reproducibility we want to print details about the R version we're using:
+
+```{r session_info}
+sessionInfo()
+```
+
+
+
+# Metabarcoding sample
+
+First, let's peek into the raw data:
+
+```{r metab_raw}
+raw.reads <- read.csv("Data/MothPollenFinal-by-taxonomy-readcounts.blast.csv", header=TRUE)
+summary(raw.reads[,c(1:5,length(raw.reads))])
+```
+
+We can see some immediate problems with using the raw file, so at this stage I have manually done the following things:  
+  1. removed the top row so that the column headers are the top row.  
+  2. made a number of manual changes to assignments, listed in Table S7
+  3. removed the taxonomy column and created new columns detailing:  
+    a. what family each assignment belongs to ("unassigned" for assignments to higher than family-level)  
+    b. whether each assignment is wind or insect pollinated, or in the data as a positive control  
+    c. what level an assignment is made to (species, genus, family, order, class, phylum or unassigned)  
+  4. renamed the first column to "Assignment"  
+  
+Reimport the edited file:
+
+```{r metab_clean}
+plants_seq <- read.csv("Data/MothPollenFinal_prepared.csv", header=TRUE)
+summary(plants_seq[,1:6])
+```
+
+### Clean up the data
+
+The first thing to do is to clean the data. The initial step is to rule out any assignments which fall below a given read depth. Choosing this threshold is a bit subjective, so I am going to ask a series of questions and answer them (in round numbers!) by manually inspecting the dataframe:  
+  1. What threshold would remove all assigned reads from my negative wells? - 40  
+  2. What threshold would remove all assigned reads from my procedural negatives? - 50 (excluding control - see q.4)  
+  3. What threshold would remove all non-positive-control reads from my positive controls? - 50  
+  4. What threshold would remove all positive-control reads from my sample wells? - 2150. Appears to have been a batch contamination by POS2 (_Kalanchoe pinnata_). However, appears to be just limited to POS2:  
+  5. What threshold would remove all non-_Kalanchoe_/Crassulaceae positive-control reads from my sample wells (_Dracaena_ and _Crassula helmsii_)? - 5  
+  
+Accepting the contamination event involving _Kalanchoe pinnata_, it appears that 50 reads is a reasonable threshold to set. Therefore:
+
+```{r clean_low_reads}
+cutoff<-50
+
+# replace all the species that are less than the cutoff of the total reads with zero
+plants_seq[,5:339][plants_seq[,5:339] < cutoff] <- 0
+
+# copy the current version to preserve it for later
+plants_seq_preserve <- plants_seq
+```
+
+### Calculate some basic summary statistics
+
+```{r summary_prep}
+# make interaction presence binary (1 if present)
+plants_seq[,5:339][plants_seq[,5:339] > 0] <- 1
+
+# total up number of samples each assignment was detected in
+plants_seq$Samples <- rowSums(plants_seq[,5:339])
+
+# count number of assignments
+plants_seq$Count <- ifelse((plants_seq$Samples==0),0,1)
+
+# print a summary table
+summary <- plants_seq[,c(1:4,340:341)]
+summary
+```
+
+We can see that a number of assignments have been dropped altogether by the threshold (e.g. _Ranunculus_, _Silene_). Here's the full list:  
+```{r list_removed}
+removed <- data.frame(ifelse(plants_seq$Count==0,as.character(plants_seq$Assignment),NA))
+removed <- removed[complete.cases(removed),]
+removed
+```
+
+Drop those rows entirely:
+
+```{r drop_removed}
+plants_seq <- plants_seq[plants_seq$Count!=0,]
+plants_seq[,c(1:4,340:341)]
+```
+
+
+
+Now, of those kept, we can calculate some basic summaries.
+
+##### Levels of assignment
+
+```{r assign_levs_summary}
+assign_levs <- ddply(plants_seq[,c(1:4,340:341)], .(AssignmentLevel), numcolwise(sum))
+assign_levs
+```
+
+##### Families
+
+Let's do the same for plant families:
+```{r plant_fams_summary, echo=TRUE}
+families <- ddply(plants_seq[,c(1:4,340:341)], .(Family), numcolwise(sum))
+families
+```
+
+##### And finally by pollination categories (i.e. "how has this gotten into my dataset?")
+```{r pollination_summary}
+poll_cats <- ddply(plants_seq[,c(1:4,340:341)], .(Pollination), numcolwise(sum))
+poll_cats
+```
+
+### Interaction data
+##### Introducing information about the insects
+
+We go back at this point to the earlier preservation. Let's start by removing the empty rows.
+
+```{r drop_empty}
+plants_seq_preserve1 <- plants_seq_preserve[rowSums(plants_seq_preserve[,5:339])!=0,]
+```
+
+First get rid of higher-level assignments, which is fine: we don't know enough about these to keep them. We only need to retain the assignment name and the actual read depths from each row.
+```{r trim_non_interactions}
+plants_intermediate <- plants_seq_preserve1[plants_seq_preserve1$Pollination!="unassigned",]
+plants_reads <- plants_intermediate[,c(1,5:length(plants_intermediate))]
+plants_intermediate2 <- plants_intermediate[plants_intermediate$Pollination=="Insect",]
+plants_interactions <- plants_intermediate2[,c(1,5:length(plants_intermediate2))]
+```
+
+A quick diversion in order to calculate the number of plant OTUs detected in only one sample.
+
+```{r single_sample_OTUs}
+single_sample <- plants_interactions
+single_sample[,2:length(single_sample)][single_sample[,2:length(single_sample)] > 0] <- 1
+
+single_sample$Samples <- rowSums(single_sample[,2:length(single_sample)])
+summary(single_sample$Samples)
+
+single_sample$Samples <- ifelse(single_sample$Samples==1,1,0)
+SingleSamplePlants <- sum(single_sample$Samples)
+
+```
+
+
+Now, returning to the aim, transpose the dataframe then correct the sample codes, removing the ".blast" from each
+ 
+```{r transpose_and_correct}
+# prepare the assignment names and transpose the dataframe
+rownames(plants_reads) <- plants_reads[,1]
+plants_reads <- plants_reads[,2:336]
+samples_reads <- data.frame(t(plants_reads))
+
+# move the sample names into the first column
+samples_reads$Reference <- rownames(samples_reads)
+samples_reads <- samples_reads[,c(length(samples_reads),1:(length(samples_reads)-1))]
+
+# correct the sample names
+head(samples_reads$Reference)
+
+for (i in 1:nrow(samples_reads)){
+samples_reads$Reference[i] <- unlist(strsplit(samples_reads$Reference[i], split='.', fixed=TRUE))[1]
+}
+
+head(samples_reads$Reference)
+```
+
+Now we can import information about the insects corresponding to each sample code. This information is held in a file called "moth_metadata.csv".
+
+```{r add_insect_metadata}
+moth_metadata <- read.csv("Data/moth_metadata.csv", header=TRUE)
+summary(moth_metadata)
+```
+
+We want to merge the two together using the 'Reference' column from the metadata dataframe and the 'Sample' column from the interaction dataframe.
+
+```{r append_moth_metadata}
+reads <- merge(moth_metadata,samples_reads, all=TRUE)
+head(reads[,1:6])
+tail(reads[,1:6])
+```
+
+This has worked, but there are the control wells at the bottom which have failed to merge properly (because they have no equivalent in the moth metadata file). Let's label those control wells, and set up two separate sub-dataframes based on the labels.
+
+```{r label_control_wells}
+reads$type<-as.factor(ifelse(grepl("POS1",reads$Reference),"DNA +ve",
+                            ifelse(grepl("POS2",reads$Reference),"DNA +ve",
+                                   ifelse(grepl("POS3",reads$Reference),"PCR +ve",
+                                          ifelse(grepl("POS4",reads$Reference),"PCR +ve",
+                                                 ifelse(grepl("NEG",reads$Reference),"PCR -ve",
+                                                        ifelse(grepl("PROC",reads$Reference),"Proc -ve","Sample")))))))
+
+summary(reads$type)
+
+controls <- reads[reads$type!="Sample",]
+insects <- reads[reads$type=="Sample",]
+```
+
+##### Summary of positive and negative control wells
+
+Let's use this information to investigate how bad were the contamination issues. First, let's look for positive controls in the sample wells:
+
+```{r pos_neg_summary1, echo=FALSE}
+readsKP <- sum(insects$Kalanchoe_pinnata)
+wellsKP <- sum(insects$Kalanchoe_pinnata!=0)
+readsC <- sum(insects$Crassulaceae)
+wellsC <- sum(insects$Crassulaceae!=0)
+readsD <- sum(insects$Dracaena)
+wellsD <- sum(insects$Dracaena!=0)
+readsCH <- sum(insects$Crassula_helmsii)
+wellsCH <- sum(insects$Crassula_helmsii!=0)
+```
+```{r pos_neg_summary2, echo=FALSE}
+cat(readsKP," reads in ",wellsKP," wells of Kalanchoe pinnata; ")
+cat(readsC," reads in ",wellsC," wells of Crassulaceae; ")
+cat(readsD," reads in ",wellsD," wells of Dracaena; ")
+cat(readsCH," reads in ",wellsCH," wells of Crassula helmsii")
+
+```
+
+Clearly, there was a large degree of contamination by _Kalanchoe pinnata_ (Crassulaceae), which was a DNA positive (POS2), but as there appears to be no sample-well contamination by _Dracaena_ (DNA positive POS1) or _Crassula_ (possibly PCR positive POS3), and no sign in the output of the other PCR positive (POS4), we can safely assume that this came from a single contamination event of 'everything else' by POS2 and not an indication of widespread cross-contamination between wells.   
+
+Let's now look at the control wells themselves.
+
+```{r pos_neg_summary3}
+controls$total <- rowSums(controls[,c(5:(length(controls)-1))])
+controls[,c(1,(length(controls)-1):length(controls))]
+```
+
+There are no reads in the negative controls, which is reassuring (there is a very low read-depth in one procedural negative but on visual inspection this comes from the batch-contamination by _Kalanchoe_ so is not worth additional worry).
+
+
+```{r pos_neg_summary4, echo=FALSE}
+readsKP <- sum(controls$Kalanchoe_pinnata)
+wellsKP <- sum(controls$Kalanchoe_pinnata!=0)
+readsC <- sum(controls$Crassulaceae)
+wellsC <- sum(controls$Crassulaceae!=0)
+readsD <- sum(controls$Dracaena)
+wellsD <- sum(controls$Dracaena!=0)
+readsCH <- sum(controls$Crassula_helmsii)
+wellsCH <- sum(controls$Crassula_helmsii!=0)
+```
+```{r pos_neg_summary5, echo=FALSE}
+cat(readsKP," reads in ",wellsKP," wells of Kalanchoe pinnata; ")
+cat(readsC," reads in ",wellsC," wells of Crassulaceae; ")
+cat(readsD," reads in ",wellsD," wells of Dracaena; ")
+cat(readsCH," reads in ",wellsCH," wells of Crassula helmsii")
+```
+
+Again we can see that there is widespread contamination by _Kalanchoe_ but that _Dracaena_ has not spread. The PCR positive POS4 appears to have failed entirely and it isn't clear that _Crassula helmsii_ is actually POS3.
+
+### Species and interaction richness
+
+Let's now start to calculate some more detailed statistics on pollen transport. We need to repeat some of the steps above on the assignments to insect-pollinated plants **only**.
+
+```{r wrangle_interactions}
+# prepare the assignment names and transpose the dataframe
+rownames(plants_interactions) <- plants_interactions[,1]
+plants_interactions <- plants_interactions[,2:336]
+samples_interactions <- data.frame(t(plants_interactions))
+
+# move the sample names into the first column
+samples_interactions$Reference <- rownames(samples_interactions)
+samples_interactions <- samples_interactions[,c(length(samples_interactions),1:(length(samples_interactions)-1))]
+
+# correct the sample names
+head(samples_interactions$Reference)
+
+for (i in 1:nrow(samples_interactions)){
+samples_interactions$Reference[i] <- unlist(strsplit(samples_interactions$Reference[i], split='.', fixed=TRUE))[1]
+}
+
+head(samples_interactions$Reference)
+```
+
+As above, append the moth metadata, label the control wells and separate out the sample wells
+
+```{r append_moth_metadata2}
+samples <- merge(moth_metadata,samples_interactions, all=TRUE)
+head(samples[,1:6])
+tail(samples[,1:6])
+```
+```{r label_control_wells2}
+samples$type<-as.factor(ifelse(grepl("POS1",samples$Reference),"DNA +ve",
+                            ifelse(grepl("POS2",samples$Reference),"DNA +ve",
+                                   ifelse(grepl("POS3",samples$Reference),"PCR +ve",
+                                          ifelse(grepl("POS4",samples$Reference),"PCR +ve",
+                                                 ifelse(grepl("NEG",samples$Reference),"PCR -ve",
+                                                        ifelse(grepl("PROC",samples$Reference),"Proc -ve","Sample")))))))
+
+summary(samples$type)
+
+# take only sample wells, leaving behind the $type column
+interactions <- samples[samples$type=="Sample",][,1:(length(samples)-1)]
+
+
+head(interactions[,1:6])
+tail(interactions[,1:6])
+
+
+
+```
+
+At this stage we no longer need to know how many reads are in each cell (this isn't considered to be representative of the quantity of pollen going in), so let's turn everything to a 1.
+```{r binary_interactions}
+interactions[,5:length(interactions)][interactions[,5:length(interactions)] > 0] <- 1
+```
+
+
+##### Basic summary statistics
+
+Summing across these rows now gives the number of species each moth is carrying. If this is zero, then no pollen was detected on that moth.
+
+```{r sp_per_indiv}
+interactions$IndividualInteractionRichness <- rowSums(interactions[,5:length(interactions)])
+interactions$PollenYN <- ifelse(interactions$IndividualInteractionRichness==0,0,1)
+
+summary(interactions$IndividualInteractionRichness)
+summary(interactions$PollenYN)
+
+PollenCarrierIndivs <- sum(interactions$PollenYN)
+PollenCarrierIndivPercent <- (mean(interactions$PollenYN)*100)
+
+Individuals <- nrow(interactions)
+
+interactions$Over1 <- ifelse(interactions$IndividualInteractionRichness > 1,1,0)
+
+PollenCarrierIndivOver1 <- sum(interactions$Over1)
+PercentIndivOver1 <- PollenCarrierIndivOver1*100/Individuals
+
+TotalInteractions <- sum(interactions$IndividualInteractionRichness)
+
+```
+
+To calculate species-level interaction statistics we need to collapse this by species.
+
+```{r sp_per_sp}
+interactions_species <- ddply(interactions[,1:(length(interactions)-3)], .(Family, BinomialName), numcolwise(sum))
+
+binary_interactions_species <- interactions_species
+binary_interactions_species[,3:length(binary_interactions_species)][binary_interactions_species[,3:length(binary_interactions_species)] > 0] <- 1
+
+binary_interactions_species$InteractionRichness <- rowSums(binary_interactions_species[,3:length(binary_interactions_species)])
+
+binary_interactions_species$PollenYN <- ifelse(binary_interactions_species$InteractionRichness==0,0,1)
+
+MothCarriers <- sum(binary_interactions_species$PollenYN)
+MothSpecies <- nrow(binary_interactions_species)
+MothCarriersPercent <- MothCarriers*100/MothSpecies
+UniqueInteractions <- sum(binary_interactions_species$InteractionRichness)
+```
+
+Statistics about plant OTUs:
+
+```{r OTUs_stats}
+plants_interactions <- plants_seq_preserve1[plants_seq_preserve1$Pollination=="Insect",]
+
+# make interaction presence binary (1 if present)
+plants_interactions[,5:339][plants_interactions[,5:339] > 0] <- 1
+
+# total up number of samples each assignment was detected in
+plants_interactions$Samples <- rowSums(plants_interactions[,5:339])
+
+# count number of assignments
+plants_interactions$Count <- ifelse((plants_interactions$Samples==0),0,1)
+
+# print a summary table
+plants_interactions[,c(1:4,(length(plants_interactions)-1):length(plants_interactions))]
+
+# sum up number of OTUs at different levels of assignment
+assign_levs_interactions <- ddply(plants_interactions[,c(1:4,(length(plants_interactions)-1):length(plants_interactions))], .(AssignmentLevel), numcolwise(sum))
+assign_levs_interactions
+
+# total of these is number of OTUs
+PlantOTUs <- sum(assign_levs_interactions$Count)
+
+# number at species level
+OTUstosp <- assign_levs_interactions$Count[3]
+OTUstosppercent <- OTUstosp*100/PlantOTUs
+
+#number not at family level
+OTUstospgen <- (PlantOTUs - assign_levs_interactions$Count[1])
+OTUstospgenpercent <- OTUstospgen*100/PlantOTUs
+
+# percent found in one sample only
+SingleSamplePlantspercent <- SingleSamplePlants*100/PlantOTUs
+```
+
+
+
+Now let's create a nice paragraph detailing all of this:
+
+```{r summary_paragraph, echo=FALSE}
+cat("We found ",PollenCarrierIndivs," moths (",PollenCarrierIndivPercent,"% of all ",Individuals," individuals) from ",MothCarriers," species (",MothCarriersPercent,"% of all ",MothSpecies," species) carrying pollen belonging to ",PlantOTUs," plant OTUs, giving ",UniqueInteractions," unique interactions. Of these, ",OTUstospgen," (",OTUstospgenpercent,"%) were identified to genus or better, of which ",OTUstosp," (",OTUstosppercent,"%) were to species. ",SingleSamplePlants," (",SingleSamplePlantspercent,"%) were identified on one moth only. ",PollenCarrierIndivOver1," moths (",PercentIndivOver1,"% of all individuals) carried more than one pollen species, giving a total of ",TotalInteractions," interactions.")
+```
+
+### Interaction completeness
+
+Now before we build a network we want to check our sampling completeness for interactions. Sampling completeness for species doesn't matter here because our moth samples are artificial and exactly equal. However, the rate at which we detect pollen on those moths may differ and so the completeness of the network may differ.
+
+
+```{r check_interaction_data}
+summary(interactions[,1:5])
+```
+
+Prepare a matrix from this dataframe and split it into a list of dataframes, one per species: 
+
+```{r prepare_list}
+# prepare the dataframe for network analysis:
+# make it a matrix and transpose it so insects are in columns
+completenessframe <- interactions[,c(4:(length(interactions)-3))]
+
+# we'll want this at a later time for running some tests on the sampling completeness method
+write.table(completenessframe, "Data\\MetaComplete.txt", sep="\t", row.names=FALSE)
+
+# create a list of smaller dframes, one per species
+dframes <- split(completenessframe, list(completenessframe$BinomialName))  # this creates a list of smaller dframes, one for each level of sample
+summary(dframes)
+# e.g.
+dframes[9]
+```
+
+
+We earlier loaded up a custom function for calculating interaction completeness. Now run this function across the list. We only have one column in the matrix (BinomialName) and we don't want a lower threshold so we don't need to specify these.
+
+```{r completeness1}
+interaction.completeness <- lapply(dframes, interaction.complete)
+```
+
+Now we have a list for every species, so combine them into a dataframe:
+
+```{r merge}
+ICmerge <- do.call("cbind", interaction.completeness)    # merge the data with one sample per column
+colnames(ICmerge) <- names(interaction.completeness)     # assign the sample names to each column
+ICmerge <- data.frame(t(ICmerge))
+head(ICmerge)
+```
+
+We can immediately see this has returned lots of NA's for species where there was no pollen found. Let's start calculating interaction completeness for the full network; first dealing with the NAs.
+
+```{r net_completeness}
+ICmerge$chao <- ifelse(ICmerge$Species==0,0,ICmerge$chao)
+
+# now we can calculate the % completeness:
+ICmerge$completeness <- (ICmerge$Species*100)/ICmerge$chao
+
+# wherever no pollen was sampled, it's produced NaNs in the completeness column
+# we need to remove these in order to calculate means
+ICgood <- ICmerge[ which( ! ICmerge$completeness %in% "NaN") , ]
+
+summary(ICgood$completeness)
+
+# calculate the network completeness - this is the weighted mean interaction sampling completeness of each species in the network, weighted by the estimated interaction richness to give more attention to more generalist species
+
+completeness <- weighted.mean(ICgood$completeness, ICgood$chao, na.rm=T)
+
+cat("The interaction sampling completeness (metabarcoding method) = ",completeness,"%")
+
+```
+
+
+### Build a network
+
+For this stage we want the interactions_species dataframe. This is semi-quantitative, as it has the number of individuals of each species interacting with each plant, but not the strength of each individual interaction. However, there is arguably no reliable way to judge strength of individual interactions from a pollen-transport system.
+
+```{r prepare_matrix}
+# prepare the dataframe for network analysis:
+# make it a matrix and transpose it so insects are in columns
+networkframe <- interactions_species[,c(2:length(interactions_species))]
+rownames(networkframe) <- networkframe[,1]             
+networkframe <- networkframe[,-1]
+networkframe <- data.frame(t(networkframe))
+```
+
+Now we can plot a web and calculate network metrics.
+```{r plot_web, echo=TRUE}
+# plot the network
+plotweb(networkframe)
+```
+
+```{r calculate_metrics}
+# calculate the network metrics
+results <- data.frame(networklevel(networkframe, 
+                                   weighted = TRUE, empty.web = TRUE,
+                                   index = c("linkage density",
+                                                        "weighted connectance",
+                                                        "connectance",
+                                                        "generality",
+                                                        "vulnerability",
+                                                        "H2")))
+results[is.na(results)] <- 0
+colnames(results) <- "Metabarcoding"                   # sets the colname as metabarcoding so we can later compare to microscopy
+```
+
+Unlike the others, robustness is based on simulations so let's bootstrap a mean +/- CIs for this.
+
+I've written a function to do this.
+
+
+```{r bootstrap_meta}
+bs_meta <- bootstrap_robustness(networkframe, 100) # used 1000 for data in manuscript
+print(bs_meta)
+```
+
+
+We now have a web and some network metrics for the metabarcoding data - hooray! But these are a bit meaningless without something to compare them to...
+
+
+# Microscopy sample
+
+Peek into the raw data:
+
+```{r micro_raw}
+raw.counts <- read.csv("Data/MicroscopyIndivs.csv", header=TRUE)
+summary(raw.counts[,c(1:5,length(raw.counts))])
+```
+
+We can see that this is set up ready for network analysis. However, there are blanks rather than zeroes where no pollen was recorded.
+
+```{r NAs_to_zeroes}
+raw.counts[is.na(raw.counts)] <- 0
+summary(raw.counts[,c(1:5,length(raw.counts))])
+```
+
+For the microscopy analysis there is no minimum threshold - presence of a single pollen grain is accepted as an interaction here. Therefore there is no data-cleaning step.
+
+### Calculate some basic summary statistics
+
+To calculate summary statistics about plants in the dataset as we did for metabarcoding, we need a transcription of the current dataframe.
+
+```{r transcribe_micro_data}
+micro_summary <- raw.counts[,c(1,5:length(raw.counts))]
+rownames(micro_summary) <- micro_summary[,1]
+micro_summary <- micro_summary[,-1]
+micro_summary <- data.frame(t(micro_summary))
+micro_summary$Assignment <- rownames(micro_summary)
+micro_summary <- micro_summary[,c(312,1:311)]
+```
+
+Now we can start calculating summary stats. First I want to manually add some columns to this file.
+
+```{r write_micro_plants}
+write.table(micro_summary, "Data\\MicroSummary.txt", sep="\t", row.names=FALSE)
+```
+
+
+I have manually added the following columns:  
+    a. what family each assignment belongs to  
+    b. whether each assignment is wind or insect pollinated  
+    c. what level an assignment is made to (species, genus, family, order, class, phylum or unassigned)
+
+```{r micro_reimport}
+micro_plants <- read.csv("Data/PlantSpecies.csv", header=TRUE)
+summary(micro_plants[,c(1:5,length(micro_plants))])
+```
+
+### Calculate some basic summary statistics
+
+```{r micro_summary_prep}
+# make interaction presence binary
+micro_plants[,5:315][micro_plants[,5:315] > 0] <- 1
+
+# total up number of samples each assignment was detected in
+micro_plants$Samples <- rowSums(micro_plants[,5:315])
+
+# count number of assignments
+micro_plants$Count <- ifelse((micro_plants$Samples==0),0,1)
+
+# print a summary table
+micro_plants[,c(1:4,316:317)]
+```
+
+##### Levels of assignment
+
+```{r micro_assign_levs_summary}
+micro_assign_levs <- ddply(micro_plants[,c(1:4,316:317)], .(AssignmentLevel), numcolwise(sum))
+micro_assign_levs
+```
+
+##### Families
+
+Let's do the same for plant families:
+```{r micro_plant_fams_summary}
+micro_families <- ddply(micro_plants[,c(1:4,316:317)], .(Family), numcolwise(sum))
+micro_families
+```
+
+##### And finally by pollination categories (i.e. "how has this gotten into my dataset?")
+```{r micro_pollination_summary}
+micro_poll_cats <- ddply(micro_plants[,c(1:4,316:317)], .(Pollination), numcolwise(sum))
+micro_poll_cats
+```
+
+### Species and interaction richness
+
+Let's now start to calculate some more detailed statistics on pollen transport. This time let's start with further information about the plant OTUs, because that's what we've just been using.
+
+
+```{r micro_OTUs_stats}
+micro_plants_interactions <- micro_plants[,1:315][micro_plants$Pollination=="Insect",]
+
+# total up number of samples each assignment was detected in
+micro_plants_interactions$Samples <- rowSums(micro_plants_interactions[,5:315])
+
+# count number of assignments
+micro_plants_interactions$Count <- ifelse((micro_plants_interactions$Samples==0),0,1)
+
+# print a summary table
+micro_plants_interactions[,c(1:4,316:317)]
+
+# sum up number of OTUs at different levels of assignment
+micro_assign_levs_interactions <- ddply(micro_plants_interactions[,c(1:4,316:317)], .(AssignmentLevel), numcolwise(sum))
+micro_assign_levs_interactions
+
+# total of these is number of OTUs
+micro_PlantOTUs <- sum(micro_assign_levs_interactions$Count)
+
+# number at species level
+micro_OTUstosp <- micro_assign_levs_interactions$Count[3]
+micro_OTUstosppercent <- micro_OTUstosp*100/micro_PlantOTUs
+
+#number not at family level
+micro_OTUstospgen <- (micro_PlantOTUs - micro_assign_levs_interactions$Count[1])
+micro_OTUstospgenpercent <- micro_OTUstospgen*100/micro_PlantOTUs
+```
+
+A quick diversion in order to calculate the number of plant OTUs detected in only one sample.
+
+```{r micro_single_sample_OTUs}
+micro_plants_interactions$SingleSamples <- ifelse(micro_plants_interactions$Samples==1,1,0)
+summary(micro_plants_interactions$SingleSamples)
+
+micro_SingleSamplePlants <- sum(micro_plants_interactions$SingleSamples)
+```
+
+
+
+
+Now we need to return to insects in rows, and drop the column 'Poaceae' in order to retain insect-pollinated assignments only. Then we can make every interaction a 1 again.
+
+```{r prep_micro}
+micro_interactions <- raw.counts[,-5]
+micro_interactions[,5:24][micro_interactions[,5:24] > 0] <- 1
+```
+
+##### Basic summary statistics
+
+Summing across these rows now gives the number of species each moth is carrying. If this is zero, then no pollen was detected on that moth.
+
+```{r micro_sp_per_indiv}
+micro_interactions$IndividualInteractionRichness <- rowSums(micro_interactions[,5:24])
+micro_interactions$PollenYN <- ifelse(micro_interactions$IndividualInteractionRichness==0,0,1)
+
+summary(micro_interactions$IndividualInteractionRichness)
+summary(micro_interactions$PollenYN)
+
+micro_PollenCarrierIndivs <- sum(micro_interactions$PollenYN)
+micro_PollenCarrierIndivPercent <- (mean(micro_interactions$PollenYN)*100)
+
+micro_Individuals <- nrow(micro_interactions)
+
+micro_interactions$Over1 <- ifelse(micro_interactions$IndividualInteractionRichness > 1,1,0)
+
+micro_PollenCarrierIndivOver1 <- sum(micro_interactions$Over1)
+micro_PercentIndivOver1 <- micro_PollenCarrierIndivOver1*100/micro_Individuals
+
+micro_TotalInteractions <- sum(micro_interactions$IndividualInteractionRichness)
+
+```
+
+To calculate species-level interaction statistics we need to collapse this by species.
+
+```{r micro_sp_per_sp}
+micro_interactions_species <- ddply(micro_interactions[,1:24], .(Family, BinomialName), numcolwise(sum))
+
+micro_binary_interactions_species <- micro_interactions_species
+micro_binary_interactions_species[,3:22][micro_binary_interactions_species[,3:22] > 0] <- 1
+
+micro_binary_interactions_species$InteractionRichness <- rowSums(micro_binary_interactions_species[,3:22])
+
+micro_binary_interactions_species$PollenYN <- ifelse(micro_binary_interactions_species$InteractionRichness==0,0,1)
+
+micro_MothCarriers <- sum(micro_binary_interactions_species$PollenYN)
+micro_MothSpecies <- nrow(micro_binary_interactions_species)
+micro_MothCarriersPercent <- micro_MothCarriers*100/micro_MothSpecies
+
+micro_SingleSamplePlantspercent <- micro_SingleSamplePlants*100/micro_PlantOTUs
+
+micro_UniqueInteractions <- sum(micro_binary_interactions_species$InteractionRichness)
+```
+
+
+Now let's create a nice paragraph detailing all of this:
+
+```{r micro_summary_paragraph, echo=FALSE}
+cat("We found ",micro_PollenCarrierIndivs," moths (",micro_PollenCarrierIndivPercent,"% of all ",micro_Individuals," individuals) from ",micro_MothCarriers," species (",micro_MothCarriersPercent,"% of all ",micro_MothSpecies," species) carrying pollen belonging to ",micro_PlantOTUs," plant OTUs, giving ",micro_UniqueInteractions," unique interactions. Of these, ",micro_OTUstospgen," (",micro_OTUstospgenpercent,"%) were identified to genus or better, of which ",micro_OTUstosp," (",micro_OTUstosppercent,"%) were to species. ",micro_SingleSamplePlants," (",micro_SingleSamplePlantspercent,"%) were identified on one moth only. ",micro_PollenCarrierIndivOver1," moths (",micro_PercentIndivOver1,"% of all individuals) carried more than one pollen species, giving a total of ",micro_TotalInteractions," interactions.")
+```
+
+
+### Interaction completeness
+
+Now before we build a network we want to check our sampling completeness for interactions. Sampling completeness for species doesn't matter here because our moth samples are artificial and exactly equal. However, the rate at which we detect pollen on those moths may differ and so the completeness of the network may differ.
+
+
+```{r micro_check_data}
+summary(micro_interactions[,1:5])
+```
+
+Prepare a matrix from this dataframe and split it into a list of dataframes, one per species: 
+
+```{r micro_prepare_list}
+# prepare the dataframe for network analysis:
+# make it a matrix and transpose it so insects are in columns
+micro_completenessframe <- micro_interactions[,c(4:24)]
+
+# again we want to preserve this table
+write.table(micro_completenessframe, "Data/MicroComplete.txt",sep="\t",row.names=FALSE)
+
+# create a list of smaller dframes, one per species
+micro_dframes <- split(micro_completenessframe, list(micro_completenessframe$BinomialName))  # this creates a list of smaller dframes, one for each level of sample
+summary(micro_dframes)
+# e.g.
+micro_dframes[9]
+```
+
+Callum's custom function for calculating interaction completeness should still be loaded from above. Run this function across the list. We only have one column in the matrix (BinomialName) and we don't want a lower threshold so we don't need to specify these.
+
+```{r micro_completeness}
+micro_interaction.completeness <- lapply(micro_dframes, interaction.complete)
+```
+
+Now we have a list for every species, so combine them into a dataframe:
+
+```{r micro_merge}
+micro_ICmerge <- do.call("cbind", micro_interaction.completeness)    # merge the data with one sample per column
+colnames(micro_ICmerge) <- names(micro_interaction.completeness)     # assign the sample names to each column
+micro_ICmerge <- data.frame(t(micro_ICmerge))
+head(micro_ICmerge)
+```
+
+We can immediately see this has returned lots of NA's for species where there was no pollen found. Let's start calculating interaction completeness for the full network; first dealing with the NAs.
+
+```{r micro_net_completeness}
+micro_ICmerge$chao <- ifelse(micro_ICmerge$Species==0,0,micro_ICmerge$chao)
+
+# now we can calculate the % completeness:
+micro_ICmerge$completeness <- (micro_ICmerge$Species*100)/micro_ICmerge$chao
+
+# wherever no pollen was sampled, it's produced NaNs in the completeness column
+# we need to remove these in order to calculate means
+micro_ICgood <- micro_ICmerge[ which( ! micro_ICmerge$completeness %in% "NaN") , ]
+
+summary(micro_ICgood$completeness)
+
+# calculate the network completeness - this is the weighted mean interaction sampling completeness of each species in the network, weighted by the estimated interaction richness to give more attention to more generalist species
+
+micro_completeness <- weighted.mean(micro_ICgood$completeness, micro_ICgood$chao, na.rm=T)
+
+cat("The interaction sampling completeness (microscopy method) = ",micro_completeness,"%")
+
+```
+
+
+
+### Build a network
+
+For this stage we want the micro_interactions_species dataframe. This is semi-quantitative, as it has the number of individuals of each species interacting with each plant, but not the strength of each individual interaction. However, there is arguably no reliable way to judge strength of individual interactions from a pollen-transport system.
+
+```{r micro_check_interaction_data}
+summary(micro_interactions_species[,1:5])
+```
+
+Construct a network from this dataframe:
+
+
+```{r micro_prepare_matrix}
+# prepare the dataframe for network analysis:
+# make it a matrix and transpose it so insects are in columns
+micro_networkframe <- micro_interactions_species[,c(2:length(micro_interactions_species))]
+rownames(micro_networkframe) <- micro_networkframe[,1]             
+micro_networkframe <- micro_networkframe[,-1]
+micro_networkframe <- data.frame(t(micro_networkframe))
+```
+```{r micro_plot_web, echo=TRUE}
+# plot the network
+plotweb(micro_networkframe)
+```
+
+
+```{r calculate_metrics1}
+# calculate the network metrics
+micro_results <- data.frame(networklevel(micro_networkframe, index = c("linkage density",
+                                                        "weighted connectance",
+                                                        "connectance",
+                                                        "generality",
+                                                        "vulnerability",
+                                                        "H2")))
+micro_results[is.na(micro_results)] <- 0
+colnames(micro_results) <- "Microscopy"                   # sets the colname as microscopy so we can later compare to metabarcoding
+```
+
+Bootstrap those metrics.
+
+```{r bootstrap_micro}
+bs_micro <- bootstrap_robustness(micro_networkframe, 10) # used 1000 for data in manuscript
+print(bs_micro)
+```
+
+
+
+We now have a web and some network metrics for the microscopy data - hooray! Let's now compare them directly to the metabarcoding metrics.
+
+```{r merge_network_metrics}
+metrics <- cbind(results,micro_results)
+metrics
+```
+
+Let's do a quick comparison table for the actual pollinators from each method.
+
+```{r set_up_compare}
+meta_polls <- ICmerge[,c(1,2,9)]
+micro_polls <- micro_ICmerge[,c(1,2,9)]
+
+colnames(meta_polls) <- c("meta.Species","meta.chao","meta.n")
+colnames(micro_polls) <- c("micro.Species","micro.chao","micro.n")
+
+polls_compare <- cbind(meta_polls,micro_polls)
+polls_compare <- polls_compare[,c(1,4,2,5,3,6)]
+polls_compare
+```
+
+Let's run some summary stats on this table. First, a truth-check that the samples contain exactly the same set of species in the same relative abundances (if so, this will return 41 'TRUE':
+
+```{r check_species_set}
+polls_compare$truth.n <- ifelse(polls_compare$meta.n==polls_compare$micro.n,T,F)
+summary(polls_compare$truth.n)
+```
+
+Next, work out how many species are pollinators in both, how many are pollinators only according to metabarcoding, and vice versa:
+
+```{r check_polls_method}
+polls_compare$method <- factor(ifelse(polls_compare$meta.Species==0 & polls_compare$micro.Species==0,"Neither",
+                               ifelse(polls_compare$meta.Species!=0 & polls_compare$micro.Species!=0,"Both",
+                                      ifelse(polls_compare$meta.Species==0 & polls_compare$micro.Species!=0,"Microscopy",
+                                             ifelse(polls_compare$meta.Species!=0 & polls_compare$micro.Species==0,"Metabarcoding","Fail"
+                                      )))))
+summary(polls_compare$method)
+```
+We can see agreement in >75% of cases. From the 11 which are pollinators in both methods, let's see which method identifies more interactions for each:
+
+```{r more_interactions}
+polls_compare$more <- factor(ifelse(polls_compare$method!="Both","pass",
+                                    ifelse(polls_compare$meta.Species > polls_compare$micro.Species,"Metabarcoding",
+                                           ifelse(polls_compare$meta.Species < polls_compare$micro.Species,"Microscopy",
+                                                  ifelse(polls_compare$meta.Species==polls_compare$micro.Species,"Equal","Fail")))))
+summary(polls_compare$more)
+```
+
+
+
+
+
+# Statistical comparisons between methods
+
+First, let's quickly summarise the moths in each sample:
+```{r moth_summary}
+moths <- moth_metadata[,3:4]
+moths$Count <- 1
+
+moths_list <- ddply(moths, .(Family,BinomialName), numcolwise(sum))
+moths_list
+
+```
+
+
+Although we can't compare the two networks statistically, owing to the fact that we only have a sample size of 2, we can nonetheless make some comparisons by using smaller sampling units: individual moths (n = 622) and moth species (n = 41 pairs). For this purpose we need to combine the summarized interaction data from each method, first adding a column called "Method":
+
+```{r label_methods_meta}
+summary(interactions)
+# take informative columns and summaries
+meta_merge <- interactions[,c(1:4,31:33)]
+
+# label all rows with method
+meta_merge$Method <- factor("Metabarcoding")
+summary(meta_merge)
+```
+
+```{r label_methods_micro}
+summary(micro_interactions)
+# take informative columns and summaries
+micro_merge <- micro_interactions[,c(1:4,25:27)]
+
+# label all rows with method
+micro_merge$Method <- factor("Microscopy")
+summary(micro_merge)
+```
+
+Now we can merge the two datasets together, using a simple rbind because the column names are conserved across both:
+
+```{r merge_methods}
+append <- rbind(meta_merge,micro_merge)
+summary(append)
+```
+
+Finally, for these models we want some information about which specific trap the moth has come from to include as a random effect. This information is held in another file, so let's read it in and then merge them together.
+
+```{r read_trapIDs}
+TrapIDs <- read.csv("Data/Traps.csv", header=TRUE)
+summary(TrapIDs)
+
+```
+We need to do a bit of preparation before merging:
+```{r prep_trapIDs}
+# Session should be as a factor
+TrapIDs$Session <- as.factor(TrapIDs$Session)
+summary(TrapIDs)
+
+# We need an individual factor for the specific moth trap (rather than one for session and one for treatment)
+TrapIDs$TrapID <- as.factor(do.call(paste, c(TrapIDs[c("Session","Treatment")], sep = "_")))
+summary(TrapIDs)
+
+# In order to check the merge has worked correctly, we want to change the name of the Treatment column in this dframe
+colnames(TrapIDs)[3] <- "Treatment1"
+summary(TrapIDs)
+```
+
+Now we can merge this into the rest of the data:
+
+```{r merge_trapIDs}
+merged <- merge(TrapIDs,append)
+summary(merged)
+```
+
+Now let's use the Treatment columns to test this has worked correctly - if it has, the treatment column should return 100% true.
+
+```{r test_merge}
+merged$test <- as.factor(ifelse(merged$Treatment1==merged$Treatment,TRUE,FALSE))
+summary(merged$test)
+```
+
+It has worked so we can throw out the Treatment1 and test columns:
+
+```{r trim_merge}
+summary(merged)
+merged <- merged[,c(1:2,4:11)]
+merged$Method <- relevel(merged$Method, "Microscopy")
+summary(merged)
+```
+
+Just before we analyse the data, we want to use some elements of this dataframe to test the sampling completeness of moths. This may differ for each method as moths were assigned to samples randomly from the traps. First split off the data we need into two new subframes, one per method, and retain only the data we need. This then needs to be wrangled to have a column per moth species, a row per TrapID, and the abundance of each species in each trap in cells.
+
+```{r sc_moths_frames}
+sc_meta_long <- merged[which(merged$Method=="Metabarcoding"),]
+sc_meta_long$Count <- 1
+
+sc_meta_frame <- dcast(sc_meta_long, TrapID ~ BinomialName,
+                 value.var = "Count",
+                 fun.aggregate = sum)
+
+sc_micro_long <- merged[which(merged$Method=="Microscopy"),]
+sc_micro_long$Count <- 1
+
+sc_micro_frame <- dcast(sc_micro_long, TrapID ~ BinomialName,
+                  value.var = "Count",
+                  fun.aggregate = sum)
+
+```
+
+And now calculate the sampling completeness of each using the Chao2 estimator. Then merge the two together so we have a single frame to compare, transpose it, and calculate the sample completeness for each method.
+
+```{r sc_moths}
+sc_meta <- sitebased(sc_meta_frame, cols=1)
+colnames(sc_meta) <- "Metabarcoding"
+
+sc_micro <- sitebased(sc_micro_frame, cols=1)
+colnames(sc_micro) <- "Microscopy"
+
+sc <- data.frame(rbind(t(sc_meta),t(sc_micro)))
+
+sc$Completeness <- sc$Species*100/sc$chao
+
+meta_moth_completeness <- sc$Completeness[1]
+micro_moth_completeness <- sc$Completeness[2]
+```
+
+To cross-validate this, we also want to calculate the sampling completeness based on abundances within the whole sample, using the Chao1 estimator. This will be identical for each method so we need only do it once.
+
+```{r sc_samplebased}
+sc_sample_meta <- dcast(sc_meta_long, Method ~ BinomialName,
+                        value.var="Count",
+                        fun.aggregate = sum)
+
+sc_sample <- data.frame(t(samplebased(sc_sample_meta, cols = 1)))
+
+sample_completeness <- sc_sample$S.obs*100/sc_sample$S.chao1
+
+
+```
+
+Print a statement on this.
+
+```{r sc_statement}
+cat("Sampling completeness of moths was estimated as ",sample_completeness,"% using the Chao1 estimator, and ",meta_moth_completeness,"% and ",micro_moth_completeness,"% respectively for the metabarcoding and microscopy subsamples using the Chao2 estimator.")
+```
+
+Now we are ready to analyse the data. Let's first run some individual-level analyses. We collected multiple samples of moths under three different lighting treatments due to a link with another experiment, so let's include these as a covariate (as they might affect the pollen transport in a meaningful way) and include the specific trap ID as a random effect (as this might affect the pollen transport, but not in any meaningful way).
+
+
+
+#### Is there a difference in the rate at which the methods detect pollen on a moth?
+
+```{r test_indiv_PollenYN}
+# Visually inspect for obvious differences
+plot(merged$PollenYN ~ merged$Method)
+plot(merged$PollenYN ~ merged$Treatment)
+
+# This is binomial data so no need to worry about error distribution
+model1 <- glmer(PollenYN ~ Method + Treatment
+                + (1|TrapID),
+                family=binomial(link="logit"),
+                data=merged)
+
+summary(model1)
+drop1(model1, test="Chi")
+```
+
+
+
+
+#### Is there a difference in the rate at which the methods detect _multiple pollen types_ on a single moth?
+
+```{r test_indiv_Over1}
+# Visually inspect
+plot(merged$Over1 ~ merged$Method)
+plot(merged$Over1 ~ merged$Treatment)
+
+# Again the data is binomial
+model2 <- glmer(Over1 ~ Method + Treatment
+                + (1|TrapID),
+                family=binomial(link="logit"),
+                data=merged)
+
+summary(model2)
+drop1(model2, test="Chi")
+```
+
+
+
+
+#### Finally, is there a difference between the methods in the number of pollen types detected per moth?
+
+```{r test_indiv_interaction_richness}
+# Visually inspect
+plot(merged$IndividualInteractionRichness ~ merged$Method)
+plot(merged$IndividualInteractionRichness ~ merged$Treatment)
+
+# now the data is not binomial so we need to think about error distribution. It is most likely to be Poisson. Let's first plot a histogram.
+hist(merged$IndividualInteractionRichness)
+hist(log(merged$IndividualInteractionRichness+1,10))
+
+model3 <- glmer(IndividualInteractionRichness ~ Method + Treatment
+                + (1|TrapID),
+                family=poisson(link="log"),
+                data=merged)
+
+summary(model3)
+drop1(model3, test="Chi")
+```
+
+On this occasion we need to check the residuals. I've written a custom function for doing this which we loaded in at the top. We need to specify the model and two variables to plot the residual against.
+
+```{r check_model3}
+chkres(model3, merged$Method, merged$Treatment)
+```
+
+There are clear problems with these residuals, not least that they are mostly negative and there is a large difference in spread between the two methods. Let's try a different error distribution.
+
+```{r model3nb}
+# Negative binomial
+model3nb <- glmer.nb(IndividualInteractionRichness ~ Method + Treatment
+                     + (1|TrapID),
+                     data = merged)
+
+summary(model3nb)
+drop1(model3nb, test="Chi")
+
+chkres(model3nb, merged$Method, merged$Treatment)
+```
+
+If anything, these are worse. Probably a better approach is to use a zero-inflation model.
+
+```{r model3zip}
+# zero-inflated poisson
+model3ZIP <- glmmadmb(IndividualInteractionRichness ~  Method + Treatment
+                      + (1|TrapID),
+                      zeroInflation=TRUE,
+                      family = "poisson",
+                      data = merged)
+
+summary(model3ZIP)
+
+Anova(model3ZIP, type="III")
+
+ chkres.zi(model3ZIP, merged$Method, merged$Treatment) # these aren't great either
+
+```
+
+Try Quasi-poisson
+
+```{r model3QP}
+# QuasiPoisson model using MASS
+model3QP <- glmmPQL(IndividualInteractionRichness ~ Method + Treatment,
+                   random = list(~1|TrapID),
+                   family = quasipoisson (link = "log"),
+                   data = merged)
+
+summary(model3QP)
+
+chkres.PQL(model3QP, merged$Method, merged$Treatment)
+```
+
+Try Gaussian with log-transformation (try both base 10 and natural logarithms)
+
+Base 10
+```{r model3G10}
+# Gaussian with log transformation
+model3G10 <- lmer(log(IndividualInteractionRichness+1,10) ~ Method + Treatment
+                  + (1|TrapID),
+                  data = merged)
+
+summary(model3G10)
+drop1(model3G10, test = "Chi")
+
+chkres(model3G10, merged$Method, merged$Treatment)
+```
+
+Natural
+```{r model3Gn}
+# Gaussian with log transformation
+model3Gn <- lmer(log(IndividualInteractionRichness+1) ~ Method + Treatment
+                 + (1|TrapID),
+                 data = merged)
+
+summary(model3Gn)
+drop1(model3Gn, test = "Chi")
+
+chkres(model3Gn, merged$Method, merged$Treatment)
+```
+
+None of these are perfect but the Gaussian + log transformations looks to be the most balanced of the lot, so let's use one of those. There is very little to choose between the two, but using a natural logarithm makes things easier if at some point we want to compare to a Poisson model with log link (which uses natural log), so let's go with that one.
+
+```{r indiv_inter_rich}
+summary(model3Gn)
+drop1(model3Gn, test="Chi")
+```
+
+#### Number of pollen types per pollen-positive moth
+We want to repeat this analysis for pollen-positive moths only, in case the different probability of zeroes we've already demonstrated skews things.
+
+```{r test_indiv_interaction_richnessP}
+mergeP <- merged[which(merged$PollenYN==1),]
+
+# Visually inspect
+plot(mergeP$IndividualInteractionRichness ~ mergeP$Method)
+plot(mergeP$IndividualInteractionRichness ~ mergeP$Treatment)
+
+# now the data is not binomial so we need to think about error distribution. It is most likely to be Poisson. Let's first plot a histogram.
+hist(mergeP$IndividualInteractionRichness)
+hist(log(mergeP$IndividualInteractionRichness,10))
+
+model3P <- glmer(IndividualInteractionRichness ~ Method + Treatment
+                + (1|TrapID),
+                family=poisson(link="log"),
+                data=mergeP)
+
+summary(model3P)
+drop1(model3P, test="Chi")
+
+chkres(model3P, mergeP$Method, mergeP$Treatment)
+```
+As before, residuals are not awful but not great either. Let's skip straight to the end of that model selection process as things are not likely to have changed much:
+
+Natural log + Gaussian
+```{r model3GnP}
+# Gaussian with log transformation
+model3GnP <- lmer(log(IndividualInteractionRichness, 10) ~ Method + Treatment
+                 + (1|TrapID),
+                 data = mergeP)
+
+summary(model3GnP)
+drop1(model3GnP, test = "Chi")
+
+chkres(model3GnP, mergeP$Method, mergeP$Treatment)
+```
+
+There are clear problems with these residuals, not least that they are mostly positive and there is a large difference in spread between the two methods. Let's try a different error distribution.
+
+```{r model3nbP}
+# Negative binomial
+model3nbP <- glmer.nb(IndividualInteractionRichness ~ Method + Treatment
+                     + (1|TrapID),
+                     data = mergeP)
+
+summary(model3nbP)
+drop1(model3nbP, test="Chi")
+
+chkres(model3nbP, mergeP$Method, mergeP$Treatment)
+```
+
+Try Quasi-poisson
+
+```{r model3QPP}
+# QuasiPoisson model using MASS
+model3QPP <- glmmPQL(IndividualInteractionRichness ~ Method + Treatment,
+                   random = list(~1|TrapID),
+                   family = quasipoisson (link = "log"),
+                   data = mergeP)
+
+summary(model3QPP)
+Anova(model3QPP, type="III")
+
+chkres.PQL(model3QPP, mergeP$Method, mergeP$Treatment)
+```
+
+```{r model3zip1}
+# zero-inflated poisson
+model3ZIPP <- glmmadmb(IndividualInteractionRichness ~  Method + Treatment
+                      + (1|TrapID),
+                      zeroInflation=TRUE,
+                      family = "poisson",
+                      data = mergeP)
+
+summary(model3ZIPP)
+
+Anova(model3ZIPP, type="III")
+
+ chkres.zi(model3ZIPP, mergeP$Method, mergeP$Treatment) # these aren't great either
+
+```
+
+All methods produce roughly comparable residuals so we should go with the simplest, most theoretically-appropriate model, which is Poisson.
+
+```{r final_model3}
+summary(model3P)
+drop1(model3P, test="Chi")
+```
+
+### Species-level analyses
+
+In theory, we already have the data for this, but when we inspect it:
+
+```{r collapse_merge}
+summary(polls_compare)
+```
+
+...we can see it's in the wrong format for analysing. Let's recreate this table in a better format.
+
+```{r polls_merge}
+meta_polls$Method <- factor("Metabarcoding")
+colnames(meta_polls) <- c("PollenSpecies","chao","n","Method")
+meta_polls$Species <- factor(rownames(meta_polls))
+
+micro_polls$Method <- factor("Microscopy")
+colnames(micro_polls) <- c("PollenSpecies","chao","n","Method")
+micro_polls$Species <- factor(rownames(micro_polls))
+
+polls_merge <- rbind(meta_polls,micro_polls)
+```
+
+Because the assignments aren't exactly equivalent, we can't test everything for the species that we might like to; but we can test number of interactions and likelihood of an interaction. For the latter we'll need to set up the variable.
+
+
+```{r polls_merge$PollenYN}
+polls_merge$PollenYN <- ifelse(polls_merge$PollenSpecies==0,0,1)
+polls_merge$Method <- relevel(polls_merge$Method, "Microscopy")
+summary(polls_merge)
+```
+
+#### Likelihood of pollen being found on any individual of a species
+
+We can set these analyses up in a paired fashion by setting Species as a random effect - there are exactly two entries for every level of this variable.
+
+```{r species_PollenYN}
+plot(polls_merge$PollenYN ~ polls_merge$Method)
+
+model4 <- glmer(PollenYN ~ Method + (1|Species),
+                family=binomial(link="logit"),
+                data=polls_merge)
+
+summary(model4)
+drop1(model4, test="Chi")
+```
+
+#### Number of plant species
+
+```{r PollenSpecies}
+plot(polls_merge$PollenSpecies ~ polls_merge$Method)
+
+hist(polls_merge$PollenSpecies)
+
+model5 <- glmer(PollenSpecies ~ Method + (1|Species),
+                family=poisson(link="log"),
+                data=polls_merge)
+
+summary(model5)
+drop1(model5, test="Chi")
+
+chkres(model5,polls_merge$Method,polls_merge$Species)
+```
+
+#### Plant species per pollen-transporting moth species
+We want to repeat the previous analysis, but specifically for moth species where we detected some pollen.
+
+
+```{r PollenSpeciesP}
+polls_mergeP <- polls_merge[which(polls_merge$PollenSpecies!=0),]
+
+hist(polls_mergeP$PollenSpecies)
+
+plot(polls_mergeP$PollenSpecies ~ polls_mergeP$Method)
+
+hist(polls_mergeP$PollenSpecies)
+
+model5P <- glmer(PollenSpecies ~ Method + (1|Species),
+                family=poisson(link="log"),
+                data=polls_mergeP)
+
+summary(model5P)
+drop1(model5P, test="Chi")
+
+chkres(model5P,polls_mergeP$Method,polls_mergeP$Species)
+```
+
+Residuals aren't great and analysis is close to significance so let's try some other error families:
+
+
+```{r PollenSpeciesPnb}
+model5nbP <- glmer.nb(PollenSpecies ~ Method + (1|Species),
+                data=polls_mergeP)
+
+summary(model5nbP)
+drop1(model5nbP, test="Chi")
+
+chkres(model5nbP,polls_mergeP$Method,polls_mergeP$Species)
+```
+
+Quasi-poisson
+```{r model5QPP}
+# QuasiPoisson model using MASS
+model5QPP <- glmmPQL(PollenSpecies ~ Method,
+                   random = list(~1|Species),
+                   family = quasipoisson (link = "log"),
+                   data = polls_mergeP)
+
+summary(model5QPP)
+Anova(model5QPP, type="III")
+
+chkres.PQL(model5QPP, polls_mergeP$Method, polls_mergeP$Species)
+```
+
+These are a substantial improvement on everything that's gone before, let's proceed with these.
+
+```{r final_model5P}
+summary(model5QPP)
+Anova(model5QPP, type="III")
+```
+
+
+#### Extrapolated plant species per pollinator species
+We finally want to test the *extrapolated* interaction richness per pollen-carrying pollinator species. This data is held in the two dataframes generated during the interaction completeness calculations.
+
+```{r extrap_analysis_prep}
+ICgood$Method <- factor("Metabarcoding")
+ICgood$Poll <- factor(rownames(ICgood))
+micro_ICgood$Method <- factor("Microscopy")
+micro_ICgood$Poll <- factor(rownames(micro_ICgood))
+
+sp_per_poll <- rbind(ICgood,micro_ICgood)
+summary(sp_per_poll)
+```
+
+Now this is ready to analyse.
+
+```{r test_extrap}
+# Visually inspect
+plot(sp_per_poll$chao ~ sp_per_poll$Method)
+
+sp_per_poll$Method <- relevel(sp_per_poll$Method, "Microscopy")
+
+# now the data is not Poisson (which takes integers only) so we need to think about error distribution. Let's first plot a histogram.
+hist(sp_per_poll$chao)
+hist(log(sp_per_poll$chao,10))
+
+# realistically a Poisson is probably the best fit and the most appropriate, so let's round the data to the nearest integer
+sp_per_poll$chao_int <- round(sp_per_poll$chao)
+
+hist(sp_per_poll$chao_int)
+
+
+# now try analysing with a Poisson model
+model6 <- glmer(chao_int ~ Method + (1|Species),
+                family=poisson(link="log"),
+                data=sp_per_poll)
+
+summary(model6)
+drop1(model6, test="Chi")
+
+chkres(model6,sp_per_poll$Method,sp_per_poll$Species)
+
+
+# however rounding off doesn't feel right somehow, so let's compare with a quasi-poisson
+# QuasiPoisson model using MASS
+model6QP <- glmmPQL(chao ~ Method,
+                   random = list(~1|Species),
+                   family = quasipoisson (link = "log"),
+                   data = sp_per_poll)
+
+summary(model6QP)
+Anova(model6QP, type="III")
+
+chkres.PQL(model6QP, sp_per_poll$Method, sp_per_poll$Species)
+
+```
+
+
+## Figures
+
+Let's plot some figures based on these analyses, in order.
+
+
+
+#### Is there a difference in the rate at which the methods detect pollen on a moth?
+
+```{r plot_indiv_PollenYN}
+summary(model1)
+
+# for plotting purposes we want to drop non-sig terms from the model
+model1a <- glmer(PollenYN ~ Method
+                + (1|TrapID),
+                family=binomial,
+                data=merged)
+summary(model1a) # we can see there is almost no change in model estimates from model1
+drop1(model1a, test = "Chi")
+
+# now create the framework for the plot
+newdata1 <- expand.grid(Method=c("Metabarcoding","Microscopy"),PollenYN=1)
+
+# extract the standard deviation
+errors1 <- data.frame(effect(c("Method"),model1a))
+newdata1 <- merge(newdata1,errors1)
+
+
+# construct the plot
+g1 <- ggplot(newdata1,
+             aes(x=Method, y=fit))+
+  geom_bar(colour="black",stat="identity",position=position_dodge())+
+  scale_fill_manual(values="gray70")+
+  scale_y_continuous(limits = c(0,1), oob=squish)+
+  xlab(" ")+ ylab("Proportion of\nindividuals/species")+ 
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                colour="black",size=0.8, width=0.5,
+                position=position_dodge(width=0.9))+
+  ggtitle("Single moths")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+# visualize the plot
+g1
+```
+
+
+
+
+#### Is there a difference in the rate at which the methods detect _multiple pollen types_ on a single moth?
+
+
+```{r plot_indiv_Over1}
+summary(model2)
+
+# for plotting purposes we want to drop non-sig terms from the model
+model2a <- glmer(Over1 ~ Method
+                + (1|TrapID),
+                family=binomial(link="logit"),
+                data=merged)
+
+summary(model2a)
+
+# now create the framework for the plot
+newdata2 <- expand.grid(Method=c("Metabarcoding","Microscopy"),Over1=1)
+
+
+# extract the standard deviation
+# extract the standard deviation
+errors2 <- data.frame(effect(c("Method"),model2a))
+newdata2 <- merge(newdata2,errors2)
+
+
+# construct the plot
+g2 <- ggplot(newdata2,
+             aes(x=Method, y=fit))+
+  geom_bar(colour="black",stat="identity",position=position_dodge())+
+  scale_fill_manual(values="gray70")+
+  scale_y_continuous(limits = c(0,1), oob=squish)+
+  xlab("Detection method")+ ylab("Proportion of individuals\nwith >1 pollen type")+
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                colour="black",size=0.8, width=0.5,
+                position=position_dodge(width=0.9))+
+  ggtitle("")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+# visualize the plot
+g2
+```
+
+
+
+#### Finally, is there a difference between the methods in the number of pollen types detected per moth?
+
+```{r plot_indiv_PollenTypes}
+summary(model3P)
+
+# for plotting purposes we want to drop non-important terms from the model
+model3a <- glmer(IndividualInteractionRichness ~ Method
+                + (1|TrapID),
+                family=poisson(link="log"),
+                data=mergeP)
+
+summary(model3a)
+drop1(model3a, test="Chi")  #check we haven't changed significance by doing so
+
+# now create the framework for the plot
+newdata3 <- expand.grid(Method=c("Metabarcoding","Microscopy"),IndividualInteractionRichness=1)
+mm3 <- model.matrix(terms(model3a),newdata3)
+
+# predict the model outputs
+newdata3$IndividualInteractionRichness <- predict(model3a,newdata=newdata3,type="response", re.form=NA)
+newdata3$IndivInterRich <- exp(newdata3$IndividualInteractionRichness)-1
+
+# extract the standard deviation
+pvar3 <- diag(mm3 %*% tcrossprod(vcov(model3a),mm3))
+
+# predict the 95% confidence intervals and standard error
+newdata3 <- data.frame(
+  newdata3
+  , plo = exp(newdata3$IndividualInteractionRichness-1.96*sqrt(pvar3))-1
+  , phi = exp(newdata3$IndividualInteractionRichness+1.96*sqrt(pvar3))-1
+  , selo = exp(newdata3$IndividualInteractionRichness-sqrt(pvar3))-1
+  , sehi = exp(newdata3$IndividualInteractionRichness+sqrt(pvar3))-1
+)
+
+
+# construct the plot
+g3 <- ggplot(newdata3,
+             aes(x=Method, y=IndivInterRich))+
+  geom_bar(colour="black",stat="identity",position=position_dodge())+
+  scale_fill_manual(values="gray70")+
+  scale_y_continuous(limits = c(0,5), oob=squish)+
+  xlab(" ")+ ylab(" \nPollen types\n ")+ 
+  geom_errorbar(aes(ymin = plo, ymax = phi),
+                colour="black",size=0.8, width=0.5,
+                position=position_dodge(width=0.9))+
+  ggtitle("")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+# visualize the plot
+g3
+```
+
+
+
+#### Is there a difference in the rate at which the methods detect pollen on a species?
+
+```{r plot_spec_PollenYN}
+summary(model4)
+
+# now create the framework for the plot
+newdata4 <- expand.grid(Method=c("Metabarcoding","Microscopy"),PollenYN=1)
+
+# extract the standard deviation
+errors4 <- data.frame(effect(c("Method"),model4))
+newdata4 <- merge(newdata4,errors4)
+
+
+# construct the plot
+g4 <- ggplot(newdata4,
+             aes(x=Method, y=fit))+
+  geom_bar(colour="black",stat="identity",position=position_dodge())+
+  scale_fill_manual(values="gray70")+
+  scale_y_continuous(limits = c(0,1), oob=squish)+
+  xlab(" ")+  ylab(" \n ")+
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                colour="black",size=0.8, width=0.5,
+                position=position_dodge(width=0.9))+
+  ggtitle("Moth species")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+# visualize the plot
+g4
+```
+
+
+#### Finally, is there a difference between the methods in the number of pollen types detected per moth species?
+
+```{r plot_spec_PollenTypes}
+summary(model5QPP)
+
+
+# now create the framework for the plot
+newdata5 <- expand.grid(Method=c("Metabarcoding","Microscopy"),PollenSpecies=1)
+mm5 <- model.matrix(terms(model5QPP),newdata5)
+
+# predict the model outputs
+newdata5$PollenSpecies <- predict(model5QPP,newdata=newdata5,level=0,type="response", re.form=NA)
+newdata5$PollSpec <- exp(newdata5$PollenSpecies)
+
+# extract the standard deviation
+pvar5 <- diag(mm5 %*% tcrossprod(vcov(model5QPP),mm5))
+
+# predict the 95% confidence intervals and standard error
+newdata5 <- data.frame(
+  newdata5
+  , plo = (newdata5$PollenSpecies-1.96*sqrt(pvar5))
+  , phi = (newdata5$PollenSpecies+1.96*sqrt(pvar5))
+  , selo = (newdata5$PollenSpecies-sqrt(pvar5))
+  , sehi = (newdata5$PollenSpecies+sqrt(pvar5))
+)
+
+
+# construct the plot
+g5 <- ggplot(newdata5,
+             aes(x=Method, y=PollenSpecies))+
+  geom_bar(colour="black",stat="identity",position=position_dodge())+
+  scale_fill_manual(values="gray70")+
+  scale_y_continuous(oob=squish, limits = c(0,5))+
+  xlab(" ")+  ylab(" \n \n ")+
+  geom_errorbar(aes(ymin = plo, ymax = phi),
+                colour="black",size=0.8, width=0.5,
+                position=position_dodge(width=0.9))+
+  ggtitle("")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+# visualize the plot
+g5
+```
+
+#### Finally finally, is there a difference between the methods in the extrapolated number of pollen types detected per moth species?
+
+```{r plot_spec_PollenTypes1}
+summary(model6QP)
+Anova(model6QP, type="III")
+
+# now create the framework for the plot
+newdata6 <- expand.grid(Method=c("Metabarcoding","Microscopy"),chao=1)
+mm6 <- model.matrix(terms(model6QP),newdata6)
+
+# predict the model outputs
+newdata6$chao <- predict(model6QP,newdata=newdata6,level=0,type="response", re.form=NA)
+newdata6$PollSpec <- exp(newdata6$chao)
+
+# extract the standard deviation
+pvar6 <- diag(mm6 %*% tcrossprod(vcov(model6QP),mm6))
+
+# predict the 95% confidence intervals and standard error
+newdata6 <- data.frame(
+  newdata6
+  , plo = newdata6$chao-(1.96*sqrt(pvar6))
+  , phi = newdata6$chao+(1.96*sqrt(pvar6))
+  , selo = newdata6$chao-sqrt(pvar6)
+  , sehi = newdata6$chao+sqrt(pvar6)
+)
+
+
+# construct the plot
+g6 <- ggplot(newdata6,
+             aes(x=Method, y=chao))+
+  geom_bar(colour="black",stat="identity",position=position_dodge())+
+  scale_fill_manual(values="gray70")+
+  scale_y_continuous(oob=squish, limits = c(0,15))+
+  xlab("Detection method")+  ylab(" \nEstimated pollen types")+
+  geom_errorbar(aes(ymin = plo, ymax = phi),
+                colour="black",size=0.8, width=0.5,
+                position=position_dodge(width=0.9))+
+  ggtitle("")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+# visualize the plot
+g6
+
+```
+
+### Prepare a multiplot from these
+
+```{r multiplot1}
+multiplot(g1,g3,g2,g4,g5,g6,cols=2)
+m1 <- grid.arrange(g1,g4,g3,g5,g2,g6, ncol=2,nrow=3)
+
+ggsave("Fig2multiupdate.svg", plot = m1, device = "svg", path = "Plots/", width = 29, height = 34, units = "cm")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Family-level networks
+
+In order to investigate whether the observed differences in network effects, we want to re-do some of these comparisons with the data coarsened to family level for both methods (i.e. all four Asteraceae in the metabarcoding sample, and all three in the microscopy sample, will be aggregated under simply Asteraceae). If any effects disappear then we can posit that they are attributable to differences in ability to separate out lower taxonomic groupings within families.
+First let's prepare the matrix for metabarcoding. This will require collapsing an earlier dataframe to family level, then repeating a number of steps from above:
+
+```{r prep_collapsed_meta}
+plants_families <- ddply(plants_interactions, .(Family), numcolwise(sum))
+
+# prepare the assignment names and transpose the dataframe
+rownames(plants_families) <- plants_families[,1]
+plants_families <- plants_families[,2:336]
+samples_interactions_fam <- data.frame(t(plants_families))
+
+# move the sample names into the first column
+samples_interactions_fam$Reference <- rownames(samples_interactions_fam)
+samples_interactions_fam <- samples_interactions_fam[,c(length(samples_interactions_fam),1:(length(samples_interactions_fam)-1))]
+
+# correct the sample names
+head(samples_interactions_fam$Reference)
+
+for (i in 1:nrow(samples_interactions_fam)){
+samples_interactions_fam$Reference[i] <- unlist(strsplit(samples_interactions_fam$Reference[i], split='.', fixed=TRUE))[1]
+}
+
+head(samples_interactions_fam$Reference)
+```
+
+As above, append the moth metadata, label the control wells and separate out the sample wells
+
+```{r append_moth_metadata2_fam}
+samples_fam <- merge(moth_metadata,samples_interactions_fam, all=TRUE)
+head(samples_fam[,1:6])
+tail(samples_fam[,1:6])
+```
+```{r label_control_wells2_fam}
+samples_fam$type<-as.factor(ifelse(grepl("POS1",samples_fam$Reference),"DNA +ve",
+                            ifelse(grepl("POS2",samples_fam$Reference),"DNA +ve",
+                                   ifelse(grepl("POS3",samples_fam$Reference),"PCR +ve",
+                                          ifelse(grepl("POS4",samples_fam$Reference),"PCR +ve",
+                                                 ifelse(grepl("NEG",samples_fam$Reference),"PCR -ve",
+                                                        ifelse(grepl("PROC",samples_fam$Reference),"Proc -ve","Sample")))))))
+
+summary(samples_fam$type)
+
+# take only sample wells, leaving behind the $type column
+interactions_fam <- samples_fam[samples_fam$type=="Sample",][,1:(length(samples_fam)-1)]
+
+
+head(interactions_fam[,1:6])
+tail(interactions_fam[,1:6])
+```
+
+At this stage we no longer need to know how many reads are in each cell (this isn't considered to be representative of the quantity of pollen going in), so let's turn everything to a 1.
+```{r binary_interactions_fam}
+interactions_fam[,5:length(interactions_fam)][interactions_fam[,5:length(interactions_fam)] > 0] <- 1
+```
+
+We now have a dframe saying which individual moths are interacting with which plant families. We don't need to bother with summary stats this time around, so let's skip straight to interaction completeness and networks.
+
+#### Interaction completeness
+
+```{r check_interaction_data_fam}
+summary(interactions_fam[,1:5])
+```
+
+Prepare a matrix from this dataframe and split it into a list of dataframes, one per species: 
+
+```{r prepare_list_fam}
+# prepare the dataframe for network analysis:
+# make it a matrix and transpose it so insects are in columns
+completenessframe_fam <- interactions_fam[,c(4:(length(interactions_fam)))]
+
+# create a list of smaller dframes, one per species
+dframes_fam <- split(completenessframe_fam, list(completenessframe_fam$BinomialName))  # this creates a list of smaller dframes, one for each level of sample
+summary(dframes_fam)
+# e.g.
+dframes_fam[9]
+```
+
+
+We earlier loaded up a custom function for calculating interaction completeness. Now run this function across the list. We only have one column in the matrix (BinomialName) and we don't want a lower threshold so we don't need to specify these.
+
+```{r completeness}
+interaction.completeness_fam <- lapply(dframes_fam, interaction.complete)
+```
+
+Now we have a list for every species, so combine them into a dataframe:
+
+```{r merge1}
+ICmerge_fam <- do.call("cbind", interaction.completeness_fam)    # merge the data with one sample per column
+colnames(ICmerge_fam) <- names(interaction.completeness_fam)     # assign the sample names to each column
+ICmerge_fam <- data.frame(t(ICmerge_fam))
+head(ICmerge_fam)
+```
+
+We can immediately see this has returned lots of NA's for species where there was no pollen found. Let's start calculating interaction completeness for the full network; first dealing with the NAs.
+
+```{r net_completeness1}
+ICmerge_fam$chao <- ifelse(ICmerge_fam$Species==0,0,ICmerge_fam$chao)
+
+# now we can calculate the % completeness:
+ICmerge_fam$completeness <- (ICmerge_fam$Species*100)/ICmerge_fam$chao
+
+# wherever no pollen was sampled, it's produced NaNs in the completeness column
+# we need to remove these in order to calculate means
+ICgood_fam <- ICmerge_fam[ which( ! ICmerge_fam$completeness %in% "NaN") , ]
+
+summary(ICgood_fam$completeness)
+
+# calculate the network completeness - this is the weighted mean interaction sampling completeness of each species in the network, weighted by the estimated interaction richness to give more attention to more generalist species
+
+completeness_fam <- weighted.mean(ICgood_fam$completeness, ICgood_fam$chao, na.rm=T)
+
+cat("The interaction sampling completeness (coarsened metabarcoding method) = ",completeness_fam,"%")
+
+```
+
+
+#### Build a network
+
+For this stage we want a semi-quantitative dataframe, with the number of individuals of each species interacting with each plant family, but not the strength of each individual interaction.
+
+```{r prepare_matrix_fam}
+# prepare the dataframe for network analysis:
+interactions_species_fam <- ddply(interactions_fam, .(Family, BinomialName), numcolwise(sum))
+
+# make it a matrix and transpose it so insects are in columns
+networkframe_fam <- interactions_species_fam[,c(2:length(interactions_species_fam))]
+rownames(networkframe_fam) <- networkframe_fam[,1]             
+networkframe_fam <- networkframe_fam[,-1]
+networkframe_fam <- data.frame(t(networkframe_fam))
+```
+
+Now we can plot a web and calculate network metrics.
+```{r plot_web_fam, echo=TRUE}
+# plot the network
+plotweb(networkframe_fam)
+```
+```{r calculate_metrics_fam}
+# calculate the network metrics
+results_fam <- data.frame(networklevel(networkframe_fam, index = c("linkage density",
+                                                        "weighted connectance",
+                                                        "connectance",
+                                                        "generality",
+                                                        "vulnerability",
+                                                        "H2")))
+results_fam[is.na(results_fam)] <- 0
+colnames(results_fam) <- "Metabarcoding"                   # sets the colname as metabarcoding so we can later compare to microscopy
+```
+
+Bootstrap those metrics.
+
+```{r bootstrap_meta_fam}
+bs_meta_fam <- bootstrap_robustness(networkframe_fam, 10) # used 1000 for data in manuscript
+print(bs_meta_fam)
+```
+
+We now have a web and some network metrics for the metabarcoding data - hooray! But these are a bit meaningless without something to compare them to...
+
+First we need to prepare the network dataframe. I have manually relabelled the pollen types from the microscopy data to align them with the metabarcoding assignments where possible (see Table S7), so now we need to re-import that data:
+
+
+```{r micro_reimport_fam}
+micro_plants_fam <- read.csv("Data/PlantSpecies_corrected.csv", header=TRUE)
+summary(micro_plants_fam[,c(1:5,length(micro_plants_fam))])
+```
+
+
+```{r prep_collapsed_micro}
+micro_plants_interactions_fam <- micro_plants_fam[,1:315][micro_plants_fam$Pollination=="Insect",]
+
+
+micro_plants_families <- ddply(micro_plants_interactions_fam, .(Family), numcolwise(sum))
+
+# prepare the assignment names and transpose the dataframe
+rownames(micro_plants_families) <- micro_plants_families[,1]
+micro_plants_families <- micro_plants_families[,2:312]
+micro_samples_interactions_fam <- data.frame(t(micro_plants_families))
+
+# move the sample names into the first column
+micro_samples_interactions_fam$Reference <- rownames(micro_samples_interactions_fam)
+micro_samples_interactions_fam <- micro_samples_interactions_fam[,c(length(micro_samples_interactions_fam),1:(length(micro_samples_interactions_fam)-1))]
+
+# extract the moth metadata from an earlier dataframe and merge
+micro_moth_metadata <- raw.counts[,1:4]
+micro_samples_fam <- merge(micro_moth_metadata,micro_samples_interactions_fam, all=TRUE)
+
+head(micro_samples_fam[,1:6])
+tail(micro_samples_fam[,1:6])
+```
+
+At this stage, for consistency with the metabarcoding analysis, let's turn everything to a 1.
+```{r micro_binary_interactions_fam}
+micro_samples_fam[,5:length(micro_samples_fam)][micro_samples_fam[,5:length(micro_samples_fam)] > 0] <- 1
+```
+
+We now have a dframe saying which individual moths are interacting with which plant families. We don't need to bother with summary stats this time around, so let's skip straight to interaction completeness and networks.
+
+
+### Interaction completeness
+
+Now before we build a network we want to check our sampling completeness for interactions. Sampling completeness for species doesn't matter here because our moth samples are artificial and exactly equal. However, the rate at which we detect pollen on those moths may differ and so the completeness of the network may differ.
+
+
+```{r micro_check_data_fam}
+summary(micro_samples_fam[,1:5])
+```
+
+Prepare a matrix from this dataframe and split it into a list of dataframes, one per species: 
+
+```{r micro_prepare_list_fam}
+# prepare the dataframe for network analysis:
+# make it a matrix and transpose it so insects are in columns
+micro_completenessframe_fam <- micro_samples_fam[,c(4:20)]
+
+# create a list of smaller dframes, one per species
+micro_dframes_fam <- split(micro_completenessframe_fam, list(micro_completenessframe_fam$BinomialName))  # this creates a list of smaller dframes, one for each level of sample
+summary(micro_dframes_fam)
+# e.g.
+micro_dframes_fam[9]
+```
+
+Callum's custom function for calculating interaction completeness should still be loaded from above. Run this function across the list. We only have one column in the matrix (BinomialName) and we don't want a lower threshold so we don't need to specify these.
+
+```{r micro_completeness_fam}
+micro_interaction.completeness_fam <- lapply(micro_dframes_fam, interaction.complete)
+```
+
+Now we have a list for every species, so combine them into a dataframe:
+
+```{r micro_merge_fam}
+micro_ICmerge_fam <- do.call("cbind", micro_interaction.completeness_fam)    # merge the data with one sample per column
+colnames(micro_ICmerge_fam) <- names(micro_interaction.completeness_fam)     # assign the sample names to each column
+micro_ICmerge_fam <- data.frame(t(micro_ICmerge_fam))
+head(micro_ICmerge_fam)
+```
+
+We can immediately see this has returned lots of NA's for species where there was no pollen found. Let's start calculating interaction completeness for the full network; first dealing with the NAs.
+
+```{r micro_net_completeness_fam}
+micro_ICmerge_fam$chao <- ifelse(micro_ICmerge_fam$Species==0,0,micro_ICmerge_fam$chao)
+
+# now we can calculate the % completeness:
+micro_ICmerge_fam$completeness <- (micro_ICmerge_fam$Species*100)/micro_ICmerge_fam$chao
+
+# wherever no pollen was sampled, it's produced NaNs in the completeness column
+# we need to remove these in order to calculate means
+micro_ICgood_fam <- micro_ICmerge_fam[ which( ! micro_ICmerge_fam$completeness %in% "NaN") , ]
+
+summary(micro_ICgood_fam$completeness)
+
+# calculate the network completeness - this is the weighted mean interaction sampling completeness of each species in the network, weighted by the estimated interaction richness to give more attention to more generalist species
+
+micro_completeness_fam <- weighted.mean(micro_ICgood_fam$completeness, micro_ICgood_fam$chao, na.rm=T)
+
+cat("The interaction sampling completeness (microscopy method, coarsened data) = ",micro_completeness_fam,"%")
+
+```
+
+
+
+### Build a network
+
+For this stage we want the micro_interactions_species dataframe. This is semi-quantitative, as it has the number of individuals of each species interacting with each plant, but not the strength of each individual interaction. However, there is arguably no reliable way to judge strength of individual interactions from a pollen-transport system.
+
+```{r micro_check_interaction_data_fam}
+summary(micro_interactions_species[,1:5])
+```
+
+Construct a network from this dataframe:
+
+
+```{r micro_prepare_matrix_fam}
+# prepare the dataframe for network analysis:
+micro_interactions_species_fam <- ddply(micro_samples_fam[,1:20], .(Family, BinomialName), numcolwise(sum))
+
+# make it a matrix and transpose it so insects are in columns
+micro_networkframe_fam <- micro_interactions_species_fam[,c(2:length(micro_interactions_species_fam))]
+rownames(micro_networkframe_fam) <- micro_networkframe_fam[,1]             
+micro_networkframe_fam <- micro_networkframe_fam[,-1]
+micro_networkframe_fam <- data.frame(t(micro_networkframe_fam))
+```
+```{r micro_plot_web_fam, echo=TRUE}
+# plot the network
+plotweb(micro_networkframe_fam)
+```
+
+```{r calculate_metrics_fam1}
+# calculate the network metrics
+micro_results_fam <- data.frame(networklevel(micro_networkframe_fam, index = c("linkage density",
+                                                        "weighted connectance",
+                                                        "connectance",
+                                                        "generality",
+                                                        "vulnerability",
+                                                        "H2")))
+micro_results_fam[is.na(micro_results_fam)] <- 0
+colnames(micro_results_fam) <- "Microscopy"                   # sets the colname as microscopy so we can later compare to metabarcoding
+```
+
+Bootstrap those metrics.
+
+```{r bootstrap_micro_fam}
+bs_micro_fam <- bootstrap_robustness(micro_networkframe_fam, 10) # used 1000 for data in manuscript
+print(bs_micro_fam)
+```
+
+We now have a web and some network metrics for the microscopy data - hooray! Let's now compare them directly to the metabarcoding metrics.
+
+```{r merge_network_metrics_fam}
+metrics_fam <- cbind(results_fam,micro_results_fam)
+metrics_fam
+```
+
+And bind together all the metrics
+
+```{r merge_all_metrics}
+metrics$Metric <- rownames(metrics)
+metrics$Level <- "Base"
+metrics
+
+metrics_fam$Metric <- rownames(metrics_fam)
+metrics_fam$Level <- "Family"
+metrics_fam
+
+all_metrics <- rbind(metrics,metrics_fam)
+all_metrics
+```
+
+
+
+## Preparing a network image
+
+We want a network figure for the paper. The options for drawing this in R are a little limited so I want to draw it using Food Web Designer 3.0 (Sint & Traugott 2015. JPS. Doi: 10.1007/s10340-015-0686-7). Although this software does a good job of drawing attractive and informative network diagrams, the input file format for it is a little bit weird, so I will set up the input files here.
+
+#### Species data - moths
+
+First, I need a file with the names of all the moth species, their relative abundances, and a column with the colours they will be in the network (for the latter, I have decided to colour-code them by family, and I'll produce both a colour and a greyscale version of this).
+
+The data we require for this is in the moth_metadata dframe. We need to collapse it to one row per species, counting the number of instances of each and retaining the information about families.
+
+```{r fwd_moth_prep}
+summary(moth_metadata)
+moth_metadata$Count <- 1
+
+fwd_moths <- ddply(moth_metadata[,3:5], .(Family,BinomialName), numcolwise(sum))
+summary(fwd_moths)
+
+```
+
+Now we want to add colour-coding by family. I will do greyscale shades manually as they are simple to manipulate, but I have created a .txt file with some palettes for doing colours.
+
+```{r fwd_load_colours}
+palette_plants <- read.table("Data/RGBplants.txt", header=T)
+palette_moths <- read.table("Data/RGBmoths.txt", header=T)
+```
+
+```{r fwd_moth_colour}
+fwd_mothsBW <- fwd_moths
+
+mothfams <- ddply(fwd_moths, .(Family), numcolwise(sum))
+
+mothfams <- cbind(mothfams,palette_moths)
+mothfams <- mothfams[,c(1,3)]
+
+fwd_moths <- merge(fwd_moths,mothfams)
+summary(fwd_moths$Colour)
+
+
+fwd_mothsBW$Colour <- as.character(ifelse(fwd_mothsBW$Family=="Crambidae","120,120,120",
+                           ifelse(fwd_mothsBW$Family=="Erebidae","60,60,60",
+                                  ifelse(fwd_mothsBW$Family=="Geometridae","180,180,180",
+                                         ifelse(fwd_mothsBW$Family=="Noctuidae","90,90,90",
+                                                ifelse(fwd_mothsBW$Family=="Notodontidae","150,150,150",
+                                                       ifelse(fwd_mothsBW$Family=="Sphingidae","30,30,30",
+                                                              ifelse(fwd_mothsBW$Family=="Tortricidae","128,128,128","Fail"))))))))
+
+summary(fwd_mothsBW$Colour)
+
+```
+
+Finally we want to knock off the Family column and export the finished files *without headers*.
+
+```{r fwd_moth_exp}
+fwd_moths_final <- fwd_moths[,2:4]
+write.table(fwd_moths_final, "Data\\FWDMoths.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+
+fwd_mothsBW_final <- fwd_mothsBW[,2:4]
+write.table(fwd_mothsBW_final, "Data\\FWDMothsBW.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+```
+
+This file is ready to read into FWD as the 'mid-level species'.
+
+Now we need to prepare the plant species in the same way, with a separate file for each detection method. Here, we want abundance to be the number of samples in which each plant appeared.
+
+*Important:* throughout all of this process we need to try and ensure that things are always kept in the same order, as this is important when importing the interaction data into FWD. We're going to jump ahead a bit now to set this up...
+
+```{r fwd_plant_orders}
+# we first need a list of all families detected by each method
+order_meta <- data.frame(plants_interactions[,3])
+colnames(order_meta) <- "Family"
+order_micro <- data.frame(micro_plants_interactions_fam[,2])
+colnames(order_micro) <- "Family"
+
+# merge the two lists
+order_all <- rbind(order_meta,order_micro)
+
+# add a count column (not essential but helps) and collapse the list
+order_all$Count <- 1
+order_list <- ddply(order_all, .(Family), numcolwise(sum))
+
+# sort them alphabetically by family
+order_list <- order_list[order(order_list$Family),] # bizarrely this hangs Caprifoliaceae on the end, so let's try and work around this. It's probably because Caprifoliaceae has acquired a tag somewhere along the way
+
+# convert from factor to character (will clear any tags)
+order_list$Family <- as.character(order_list$Family)
+
+# convert back to factor, with levels ordered alphabetically as standard
+order_list$Family <- factor(order_list$Family)
+
+# sort them alphabetically by family
+order_list <- order_list[order(order_list$Family),] # and it's fixed!
+
+
+seq <- data.frame(c(1:20))
+colnames(seq) <- "Order"
+
+order_list <- cbind(order_list,seq)
+
+# we can now discard the Count column
+order_list <- order_list[,-2]
+
+# and we want to add in a colour code for each family
+# this is so that the two methods match up for colours
+
+# greyscale colours (in RGB) are formatted like, for example, "65,65,65". The scale is 0,0,0 (black) to 255,255,255 (white).
+# Lighter than 200,200,200 is too light really
+# We have 20 families so we'll use every 10 from 10-200
+BWseq <- data.frame(seq(10,200,10))
+BWorder <- data.frame(c(1,4,7,10,13,16,19,2,5,8,11,14,17,20,3,6,9,12,15,18))
+
+colour <- cbind(BWseq,BWorder)                          
+colnames(colour) <- c("BWSeq","Order")
+
+colour$Shade <- paste(colour$BWSeq,colour$BWSeq,colour$BWSeq,sep=",")
+
+colour <- cbind(colour,palette_plants)
+
+order_final <- merge(order_list,colour, all=T)
+
+
+```
+
+We can now call in the order_final dataframe whenever we need to order and apply colours, to ensure consistency across all FWD input files and both methods.
+
+```{r fwd_meta_prep}
+summary(plants_interactions[,1:6])
+
+fwd_meta_prep <- plants_interactions[,c(3,1,340)]
+
+summary(fwd_meta_prep)
+```
+
+Now colour-code them. We have already prepared this, so we just need to attach the relevant data.
+
+```{r fwd_meta_colour}
+# obtain a list of Family levels in use
+fwd_meta_prep$Family <- droplevels(fwd_meta_prep$Family)
+levs_meta <- data.frame(levels(fwd_meta_prep$Family))
+
+fwd_meta <- merge(fwd_meta_prep,order_final)
+
+summary(fwd_meta$Colour)
+
+# make sure it's ordered by family (in the right order) then by species
+
+fwd_meta <- fwd_meta[order(fwd_meta$Order, fwd_meta$Assignment),] 
+
+```
+
+Finally we want to pick out the columns we need and export the finished file *without headers*.
+
+```{r fwd_meta_exp}
+fwd_meta_final <- fwd_meta[,c(2,3,7)]
+write.table(fwd_meta_final, "Data\\FWDMeta.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+
+fwd_meta_BW_final <- fwd_meta[,c(2,3,6)]
+write.table(fwd_meta_BW_final, "Data\\FWDMetaBW.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+```
+
+This file is ready to read into FWD as the 'top-level species'. Now let's repeat this process for the microscopy species.
+
+For this we need the *corrected* plant OTUs.
+
+```{r fwd_micro_prep}
+summary(micro_plants_fam[,c(1:5,314:315)])
+
+# set all interactions to be 1
+micro_plants_fam[,5:length(micro_plants_fam)][micro_plants_fam[,5:length(micro_plants_fam)] > 0] <- 1
+
+# count how many samples each plant appears in
+micro_plants_fam$Samples <- rowSums(micro_plants_fam[,5:315])
+summary(micro_plants_fam$Samples)
+
+# take the necessary columns across
+fwd_micro_prep <- micro_plants_fam[,c(2,1,316)]
+
+# drop the wind-pollinated type
+fwd_micro_prep <- fwd_micro_prep[2:21,]
+
+# order by family and assignment
+fwd_micro_prep <- fwd_micro_prep[order(fwd_micro_prep$Family, fwd_micro_prep$Assignment),] 
+summary(fwd_micro_prep)
+```
+
+Now colour-code them as before.
+
+```{r fwd_micro_colour}
+# obtain a list of Family levels in use
+fwd_micro_prep$Family <- droplevels(fwd_micro_prep$Family)
+levs_micro <- data.frame(levels(fwd_micro_prep$Family))
+
+fwd_micro <- merge(fwd_micro_prep,order_final)
+
+summary(fwd_micro$Colour)
+
+# make sure it's ordered by family (in the right order) then by species
+
+fwd_micro <- fwd_micro[order(fwd_micro$Order, fwd_micro$Assignment),] 
+
+```
+
+
+Finally we want to pick out the relevant columns and export the finished file *without headers*.
+
+```{r fwd_micro_exp}
+fwd_micro_final <- fwd_micro[,c(2,3,7)]
+write.table(fwd_micro_final, "Data\\FWDMicro.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+
+fwd_micro_BW_final <- fwd_micro[,c(2,3,6)]
+write.table(fwd_micro_BW_final, "Data\\FWDMicroBW.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+```
+
+This file is ready to read into FWD as the 'bottom-level species'. Now we turn our attention to the interaction data.
+
+For this, FWD wants a matrix for each part of the network, with consumers in rows and resources in columns. Normally in a plant-pollinator network, the plant is the resource and the pollinator the consumer. *However*, for the illustrative purposes of this network, we actually want to reverse this. Therefore, we want to produce matrices with plant species in 26 and 20 rows respectively and pollinator species in 41 columns.
+
+Within each row, we don't want the total frequency of the interaction, but the percentage of all interactions involving that plant species that are with that pollinator (this is why we've reversed the normal direction).
+
+First we need to prepare the initial matrix for the metabarcoding interactions. The raw interaction data is in a frame called networkframe from earlier. We'll need to sum each row, and then divide the cells in that row by the sum. Finally we need to make sure the order of plant species is the same as in the fwd_meta_final file (the order of pollinator species is correct already).
+
+
+```{r fwd_meta_ia_prep}
+summary(networkframe)
+fwd_meta_ia <- networkframe
+
+fwd_meta_ia$Total <- rowSums(fwd_meta_ia)
+
+fwd_meta_ia[,1:41] <- fwd_meta_ia[,1:41]*100/fwd_meta_ia[,42]
+
+
+# retrieve the data needed for re-ordering
+fwd_meta_ia_order <- fwd_meta[,1:2]
+
+# set the rownames on the matrix as a column and call it Assignment so it will merge
+fwd_meta_ia$Assignment <- rownames(fwd_meta_ia)
+
+# merge them together
+fwd_meta_ia <- merge(fwd_meta_ia_order,fwd_meta_ia)
+
+# and now merge with ordering info
+fwd_meta_ia <- merge(order_list,fwd_meta_ia)
+
+# order them by Family(ordered) and species
+fwd_meta_ia <- fwd_meta_ia[order(fwd_meta_ia$Order, fwd_meta_ia$Assignment),] 
+
+# set rownames as Assignment column 
+rownames(fwd_meta_ia) <- fwd_meta_ia$Assignment
+```
+
+
+The matrix is now ready so drop the extra columns and export with no labels.
+
+
+```{r fwd_meta_ia_exp}
+fwd_meta_ia_final <- fwd_meta_ia[,4:44]  # can visually check this is still ordered correctly
+write.table(fwd_meta_ia_final, "Data\\FWDMetaIA.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+```
+
+
+The final file we need is the interaction data for the microscopy, in the same format as the previous file. It is important that this uses the updated OTUs. Therefore, we'll have a bit of wrangling to do.
+
+```{r fwd_micro_ia_prep}
+summary(micro_plants_interactions_fam[,c(1:6,312:315)])
+
+fwd_micro_ia_prep <- micro_plants_interactions_fam[,c(1:2,5:length(micro_plants_interactions_fam))]
+
+# prepare the assignment names and transpose the dataframe
+rownames(fwd_micro_ia_prep) <- fwd_micro_ia_prep[,1]
+fwd_micro_ia_prep <- fwd_micro_ia_prep[,3:313]
+fwd_micro_ia_prep <- data.frame(t(fwd_micro_ia_prep))
+
+# move the sample names into the first column
+fwd_micro_ia_prep$Reference <- rownames(fwd_micro_ia_prep)
+fwd_micro_ia_prep <- fwd_micro_ia_prep[,c(length(fwd_micro_ia_prep),1:(length(fwd_micro_ia_prep)-1))]
+
+# extract the moth metadata from an earlier dataframe and merge
+fwd_micro_ia_prep_merge <- merge(micro_moth_metadata,fwd_micro_ia_prep, all=TRUE)
+
+head(fwd_micro_ia_prep_merge[,1:6])
+tail(fwd_micro_ia_prep_merge[,1:6])
+
+#turn everything to 1 or 0
+fwd_micro_ia_prep_merge[,5:length(fwd_micro_ia_prep_merge)][fwd_micro_ia_prep_merge[,5:length(fwd_micro_ia_prep_merge)] > 0] <- 1
+
+
+# collapse the frame by moth species
+fwd_micro_ia_moths <- ddply(fwd_micro_ia_prep_merge, .(Family,BinomialName), numcolwise(sum))
+
+# transfer moth names to rownames and re-transpose
+rownames(fwd_micro_ia_moths) <- fwd_micro_ia_moths$BinomialName
+fwd_micro_ia <- data.frame(t(fwd_micro_ia_moths[,3:length(fwd_micro_ia_moths)]))
+
+# now we are are at the same stage as we started at for metabarcoding!
+# calculate the percentages to go in the cells
+fwd_micro_ia$Total <- rowSums(fwd_micro_ia)
+
+fwd_micro_ia[,1:41] <- fwd_micro_ia[,1:41]*100/fwd_micro_ia[,42]
+
+# retrieve the data needed for re-ordering
+fwd_micro_ia_order <- micro_plants_interactions_fam[,1:2]
+
+# set the rownames on the matrix as a column and call it Assignment so it will merge
+fwd_micro_ia$Assignment <- rownames(fwd_micro_ia)
+
+# merge them together
+fwd_micro_ia <- merge(fwd_micro_ia_order,fwd_micro_ia)
+
+# and now merge with ordering info
+fwd_micro_ia <- merge(order_list,fwd_micro_ia)
+
+# order them by Family(ordered) and species
+fwd_micro_ia <- fwd_micro_ia[order(fwd_micro_ia$Order, fwd_micro_ia$Assignment),] 
+
+
+# set rownames as Assignment column 
+rownames(fwd_micro_ia) <- fwd_micro_ia$Assignment
+```
+
+The matrix is now ready so drop the extra columns and export with no labels.
+
+```{r fwd_micro_ia_exp}
+fwd_micro_ia_final <- fwd_micro_ia[,4:44]  # can visually check this is still ordered correctly
+write.table(fwd_micro_ia_final, "Data\\FWDMicroIA.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+```
+
+
+
+For the sake of comparison, we want to set up an alternative version of the interaction data. This will feature the proportion of individual pollinators of each species (as a % of the total number of individuals of that species) that are interacting with each plant species. This will need pollinators in rows and plants in columns but will otherwise be fairly similar.
+
+```{r fwd_meta_moth}
+# the necessary data is in networkframe like before
+fwd_meta_moth <- networkframe
+
+# it will need transposing but first we need to order the plants appropriately
+# retrieve the data needed for re-ordering
+fwd_meta_moth_order <- fwd_meta[,1:2]
+
+# set the rownames on the matrix as a column and call it Assignment so it will merge
+fwd_meta_moth$Assignment <- rownames(fwd_meta_moth)
+
+# merge them together
+fwd_meta_moth <- merge(fwd_meta_moth_order,fwd_meta_moth)
+
+# and now merge with ordering info
+fwd_meta_moth <- merge(order_list,fwd_meta_moth)
+
+# order them by Family(ordered) and species
+fwd_meta_moth <- fwd_meta_moth[order(fwd_meta_moth$Order, fwd_meta_moth$Assignment),] 
+
+# set rownames as Assignment column 
+rownames(fwd_meta_moth) <- fwd_meta_moth$Assignment
+
+# now remove the excess columns
+fwd_meta_moth <- fwd_meta_moth[,4:44]
+
+# everything is in the right order so now we transpose
+fwd_meta_moth <- data.frame(t(fwd_meta_moth))
+
+# extract the rownames to a column
+fwd_meta_moth$BinomialName <- rownames(fwd_meta_moth)
+```
+
+We have prepared the basic dframe, now we want to calculate the width of the bars. In general we want this to be the percentage of moths of a given species that are interacting with each plant. However, there may be instances where this sums to more than 100% (e.g. if there is only one individual of a moth species, but it interacts with three plants). In these cases it will have to be the percentage of the total interactions of that moth species that are to each plant.
+
+For example, if moth species 1 has 10 individuals, of which one interacts with plant A and two interact with plant B, the width of the links will be 10% and 20% respectively. If moth species 2 has 2 individuals with the same interactions, the width of links will be 33% and 67% respectively.
+
+To calculate this we'll need both the total abundance of each moth species and the total number of interactions.
+
+
+```{r fwd_meta_moth_stats}
+# currently the format of the two species columns doesn't match (one has spaces and the other points)
+fwd_moths$BinomialName <- factor(gsub(" ",".", fwd_moths$BinomialName))
+
+# now merge in the count data for the moths
+fwd_meta_moth <- merge(fwd_meta_moth,fwd_moths[,1:3])
+
+# now calculate the total number of interactions for each species
+fwd_meta_moth$Interactions <- rowSums(fwd_meta_moth[,2:27])
+
+# now we're ready to calculate the percentages; this will take a bit of jiggery-pokery with ifelse
+# this says: "do the cell as a percentage of either no. individuals or no. interactions, whichever is bigger"
+for (n in seq(1,nrow(fwd_meta_moth),1)){
+  if (fwd_meta_moth[n,]$Count >= fwd_meta_moth[n,]$Interactions) {
+    fwd_meta_moth[n,2:27] <- fwd_meta_moth[n,2:27]*100/fwd_meta_moth[n,]$Count
+  } else {
+    fwd_meta_moth[n,2:27] <- fwd_meta_moth[n,2:27]*100/fwd_meta_moth[n,]$Interactions
+  }
+}
+
+# now we just need to prepare this frame for export
+# re-establish row names
+rownames(fwd_meta_moth) <- fwd_meta_moth$BinomialName
+
+# sort by Family then Species
+fwd_meta_moth <- fwd_meta_moth[order(fwd_meta_moth$Family, fwd_meta_moth$BinomialName),] 
+```
+
+This is ready for export, taking only the columns with percentages in them.
+
+```{r fwd_meta_moth_exp}
+fwd_meta_moth_final <- fwd_meta_moth[,2:27]  # can visually check this is still ordered correctly
+write.table(fwd_meta_moth_final, "Data\\FWDMetaIAMoth.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+```
+
+Now we want to repeat this last process for the microscopy interactions.
+
+```{r fwd_micro_moth_prep}
+fwd_micro_moth_prep <- fwd_micro_ia_moths
+
+# unfortunately although this is in the right layout, we'll need to transpose it, order the columns, and back-transpose it again
+
+# transpose
+fwd_micro_moth_prep <- fwd_micro_moth_prep[,3:22]
+fwd_micro_moth_prep <- data.frame(t(fwd_micro_moth_prep))
+
+# attach ordering info
+fwd_micro_moth_prep$Assignment <- rownames(fwd_micro_moth_prep)
+fwd_micro_moth_prep <- merge(fwd_micro_ia_order,fwd_micro_moth_prep)
+
+# and now merge with ordering info
+fwd_micro_moth_prep <- merge(order_list,fwd_micro_moth_prep)
+
+# order them by Family(ordered) and species
+fwd_micro_moth_prep <- fwd_micro_moth_prep[order(fwd_micro_moth_prep$Order, fwd_micro_moth_prep$Assignment),] 
+
+# set rownames as Assignment column 
+rownames(fwd_micro_moth_prep) <- fwd_micro_moth_prep$Assignment
+
+# now remove the excess columns
+fwd_micro_moth_prep <- fwd_micro_moth_prep[,4:44]
+
+# everything is in the right order so now we transpose
+fwd_micro_moth_prep <- data.frame(t(fwd_micro_moth_prep))
+
+# extract the rownames to a column
+fwd_micro_moth_prep$BinomialName <- rownames(fwd_micro_moth_prep)
+
+```
+
+
+We have prepared the basic dframe, now we want to calculate the width of the bars. As above, to calculate this we'll need both the total abundance of each moth species and the total number of interactions.
+
+
+```{r fwd_micro_moth_stats}
+# merge in the count data for the moths
+fwd_micro_moth <- merge(fwd_micro_moth_prep,fwd_moths[,1:3])
+
+# now calculate the total number of interactions for each species
+fwd_micro_moth$Interactions <- rowSums(fwd_micro_moth[,2:21])
+
+# now we're ready to calculate the percentages; this will take a bit of jiggery-pokery with ifelse
+# this says: "do the cell as a percentage of either no. individuals or no. interactions, whichever is bigger"
+for (n in seq(1,nrow(fwd_micro_moth),1)){
+  if (fwd_micro_moth[n,]$Count >= fwd_micro_moth[n,]$Interactions) {
+    fwd_micro_moth[n,2:21] <- fwd_micro_moth[n,2:21]*100/fwd_micro_moth[n,]$Count
+  } else {
+    fwd_micro_moth[n,2:21] <- fwd_micro_moth[n,2:21]*100/fwd_micro_moth[n,]$Interactions
+  }
+}
+
+# now we just need to prepare this frame for export
+# re-establish row names
+rownames(fwd_micro_moth) <- fwd_micro_moth$BinomialName
+
+# sort by Family then Species
+fwd_micro_moth <- fwd_micro_moth[order(fwd_micro_moth$Family, fwd_micro_moth$BinomialName),] 
+```
+
+This is ready for export, taking only the columns with percentages in them.
+
+```{r fwd_micro_moth_exp}
+fwd_micro_moth_final <- fwd_micro_moth[,2:21]  # can visually check this is still ordered correctly
+write.table(fwd_micro_moth_final, "Data\\FWDMicroIAMoth.csv", sep=";", row.names=FALSE, col.names = FALSE, quote=F)
+```
+
+
+
+
+#### Network metric figures
+
+We want some basic figures to show change in network metrics according to sampling method and level. First we need to wrangle the dataframe so that for each combo of method+level we have one column per metric.
+
+```{r all_metrics_wrangle}
+all_metrics
+
+all_metrics_melt <- melt(all_metrics,
+                         id=c("Metric","Level"))
+
+colnames(all_metrics_melt) <- c("Metric","Level","Method","value")
+
+metricsframe <- dcast(all_metrics_melt,
+                      Method + Level ~ Metric,
+                      value.var = "value")
+
+metricsframe
+```
+
+
+Now we can plot these out one at a time.
+
+```{r plot_connectance}
+g2.2 <- ggplot(metricsframe,
+               aes(x=Method, y=connectance, group=Level))+
+  geom_point(colour="black",stat="identity")+
+  geom_line(aes(linetype=factor(Level)),
+    colour="black",stat="identity",size=1)+
+  scale_y_continuous(limits = c(0,1))+
+  xlab("")+  ylab(" \nConnectance")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        legend.position="none",
+        plot.title=element_text(hjust=0.5))
+
+
+g2.2
+```
+
+
+```{r plot_ld}
+g2.1 <- ggplot(metricsframe,
+               aes(x=Method, y=`linkage density`, group=Level))+
+  geom_point(colour="black",stat="identity")+
+  geom_line(aes(linetype=factor(Level)),
+    colour="black",stat="identity",size=1)+
+  scale_y_continuous(limits = c(0,10))+
+  xlab("")+  ylab(" \nLinkage density")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        legend.position="none",
+        plot.title=element_text(hjust=0.5))
+
+
+g2.1
+```
+
+
+```{r plot_generality}
+g2.3 <- ggplot(metricsframe,
+               aes(x=Method, y=generality.HL, group=Level))+
+  geom_point(colour="black",stat="identity")+
+  geom_line(aes(linetype=factor(Level)),
+    colour="black",stat="identity",size=1)+
+  scale_y_continuous(limits = c(0,10))+
+  xlab("")+  ylab(" \nGenerality")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        legend.position="none",
+        plot.title=element_text(hjust=0.5))
+
+
+g2.3
+```
+
+
+
+
+```{r plot_vulnerability}
+g2.4 <- ggplot(metricsframe,
+               aes(x=Method, y=vulnerability.LL, group=Level))+
+  geom_point(colour="black",stat="identity")+
+  geom_line(aes(linetype=factor(Level)),
+    colour="black",stat="identity",size=1)+
+  scale_y_continuous(limits = c(0,10))+
+  xlab("")+  ylab(" \nVulnerability")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        legend.position="none",
+        plot.title=element_text(hjust=0.5))
+
+
+g2.4
+```
+
+
+
+
+
+
+```{r plot_H2}
+g2.5 <- ggplot(metricsframe,
+               aes(x=Method, y=H2, group=Level))+
+  geom_point(colour="black",stat="identity")+
+  geom_line(aes(linetype=factor(Level)),
+    colour="black",stat="identity",size=1)+
+  scale_y_continuous(limits = c(0,1))+
+  xlab("Detection method")+  ylab(" \nH2' (specialisation)")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        legend.position="none",
+        plot.title=element_text(hjust=0.5))
+
+
+g2.5
+```
+
+We need something slightly different for robustness in order to get the error bars. First create the dataframe.
+
+```{r robustframe}
+bs_meta$Method <- "Metabarcoding"
+bs_meta$Level <- "Base"
+
+bs_micro$Method <- "Microscopy"
+bs_micro$Level <- "Base"
+
+bs_meta_fam$Method <- "Metabarcoding"
+bs_meta_fam$Level <- "Family"
+
+bs_micro_fam$Method <- "Microscopy"
+bs_micro_fam$Level <- "Family"
+
+robustframe <- rbind(bs_meta,bs_micro,bs_meta_fam,bs_micro_fam)
+robustframe
+```
+
+
+```{r plot_robustness}
+g2.6 <- ggplot(robustframe,
+               aes(x=Method, y=`Bootstrap mean`, group=Level))+
+  geom_point(colour="black",stat="identity")+
+  geom_line(aes(linetype=factor(Level)),
+    colour="black",stat="identity",size=1)+
+  scale_y_continuous(limits = c(0,1))+
+  xlab("Detection method")+  ylab(" \nRobustness")+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=25),
+        axis.text=element_text(color="black"),
+        legend.title=element_blank(),
+        legend.position="none",
+        plot.title=element_text(hjust=0.5))
+
+
+g2.6
+```
+
+Stitch them together in a multiplot.
+
+```{r multinetwork}
+multiplot(g2.1,g2.3,g2.5,g2.2,g2.4,g2.6,cols=2)
+
+```
+
+
+
+
