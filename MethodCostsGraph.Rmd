@@ -1,0 +1,82 @@
+---
+title: "Resource curve"
+author: "C.J. Macgregor"
+date: "15 November 2016"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width=87)
+```
+
+Prepare the environment
+
+```{r prepare_environment, warning=FALSE}
+rm(list=ls())
+j <- c("reshape2","ggplot2","rmarkdown","plyr","scales","directlabels")
+
+new.packages <- j[!(j %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, repos = "http://star-www.st-andrews.ac.uk/cran/")
+
+lapply(j, require, character.only = TRUE)
+```
+
+
+Prepare the dataframe for curve (microscopy)
+
+```{r prepare_micro}
+newdata1 <- expand.grid("Samples"=seq(1,500,1))
+
+newdata1$Investment <- 350+ (newdata1$Samples) - (20000/(100+newdata1$Samples))
+
+newdata1$Method <- "Microscopy"
+```
+
+
+Prepare the dataframe for the curve (metabarcoding)
+
+
+```{r prepare_meta}
+newdata2 <- expand.grid("Samples"=seq(1,500,1))
+
+newdata2$Investment <- 500+20*(floor(newdata2$Samples/96))
+
+newdata2$Method <- "Metabarcoding"
+```
+
+
+Merge
+```{r prepare}
+newdata <- rbind(newdata1,newdata2)
+
+```
+
+
+
+
+Plot the curves against each other
+
+
+```{r plot}
+# construct the plot
+g1 <- ggplot(newdata,
+             aes(x=Samples, y=Investment, group=Method))+
+  geom_line(colour="black",size=1.2)+
+  xlab("No. samples")+  ylab("Investment (time and cost)")+
+  xlim(0,550) + ylim(0,1050)+
+  theme(panel.background=element_rect(fill="white"),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(colour="gray70"),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color="black",fill=F,size=1),
+        text=element_text(size=35),
+        axis.text=element_blank(),
+        legend.title=element_blank())
+
+
+
+# visualize the plot
+g1
+```
+
