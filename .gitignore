@@ -4,6 +4,6 @@
 .Ruserdata
 *.html
 *.md
-Data/
-DevFilesNonArchived/
-Plots/
+R/Data/
+R/DevFilesNonArchived/
+R/Plots/
