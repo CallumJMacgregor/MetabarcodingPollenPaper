@@ -29,7 +29,7 @@ data <- data.frame(c("robustness.HL,robustness.LL"))
   data <- cbind(data,robust)
   }  
   mean <- data.frame(rowMeans(data[1,2:length(data)]))
-  lbound <- repeats*0.025
+  lbound <- max(1,repeats*0.025)
   ubound <- repeats*0.975
   robust.HL <- as.matrix(data[1,2:length(data)])
   LCI <- sort(robust.HL)[lbound]
