@@ -20,18 +20,17 @@ Clear the workspace, make a list of required packages, check for any that aren't
 
 ```{r prepare_environment, warning=FALSE}
 rm(list=ls())
-j <- c("reshape2","ggplot2","rmarkdown","plyr","bipartite","vegan","lme4","MASS","car","scales","AICcmodavg","effects","gridExtra")
+j <- c("reshape2","ggplot2","rmarkdown","plyr","bipartite","vegan","lme4","glmmADMB","MASS","car","scales","AICcmodavg","effects","gridExtra")
 
 new.packages <- j[!(j %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages, repos = "http://star-www.st-andrews.ac.uk/cran/")
 
 lapply(j, require, character.only = TRUE)
 ```
-
 Load up Callum's custom functions, for calculating interaction completeness and plotting model residuals, and one sourced from elsewhere for multiplots:
 
 ```{r load_function}
-f <- c("SpecAccumFunctions.R","CheckResidsFunction.R","MultiplotFunction.R","NetworkBootstrapFunction.R","SCW.R")
+f <- c("SpecAccumFunctions.R","CheckResidsFunction.R","MultiplotFunction.R","NetworkBootstrapFunction.R")
 lapply(f, source)
 ```
 
@@ -282,7 +281,7 @@ cat(readsD," reads in ",wellsD," wells of Dracaena; ")
 cat(readsCH," reads in ",wellsCH," wells of Crassula helmsii")
 ```
 
-Again we can see that there is widespread contamination by _Kalanchoe_ but that _Dracaena_ has not spread. The PCR positive POS4 appears to have failed entirely and it isn't certain that _Crassula helmsii_ is actually POS3.
+Again we can see that there is widespread contamination by _Kalanchoe_ but that _Dracaena_ has not spread. The PCR positive POS4 appears to have failed entirely and it isn't clear that _Crassula helmsii_ is actually POS3.
 
 ### Species and interaction richness
 
@@ -448,19 +447,6 @@ completenessframe <- interactions[,c(4:(length(interactions)-3))]
 # we'll want this at a later time for running some tests on the sampling completeness method
 write.table(completenessframe, "Data\\MetaComplete.txt", sep="\t", row.names=FALSE)
 
-```
-
-We earlier loaded up a custom function (Appendix S1.2 from Macgregor _et al._ 2017 _bioRxiv_ doi: https://doi.org/10.1101/195917) for calculating interaction sampling completeness. Now run this function across the dataframe: we want to use SCw2. We can leave all flags as default except for species.col.
-
-```{r completeness1}
-interaction.completeness <- SCw2(completenessframe, species.col="BinomialName")
-completeness <- interaction.completeness[1,3]
-cat("The interaction sampling completeness (metabarcoding method) = ",completeness,"%")
-```
-
-We will also want the estimates for each species separately later, so let's prepare that:
-
-```{r completeness2}
 # create a list of smaller dframes, one per species
 dframes <- split(completenessframe, list(completenessframe$BinomialName))  # this creates a list of smaller dframes, one for each level of sample
 summary(dframes)
@@ -471,7 +457,7 @@ dframes[9]
 
 We earlier loaded up a custom function for calculating interaction completeness. Now run this function across the list. We only have one column in the matrix (BinomialName) and we don't want a lower threshold so we don't need to specify these.
 
-```{r completeness3}
+```{r completeness1}
 interaction.completeness <- lapply(dframes, interaction.complete)
 ```
 
@@ -497,6 +483,12 @@ ICmerge$completeness <- (ICmerge$Species*100)/ICmerge$chao
 ICgood <- ICmerge[ which( ! ICmerge$completeness %in% "NaN") , ]
 
 summary(ICgood$completeness)
+
+# calculate the network completeness - this is the weighted mean interaction sampling completeness of each species in the network, weighted by the estimated interaction richness to give more attention to more generalist species
+
+completeness <- weighted.mean(ICgood$completeness, ICgood$chao, na.rm=T)
+
+cat("The interaction sampling completeness (metabarcoding method) = ",completeness,"%")
 
 ```
 
@@ -540,7 +532,7 @@ I've written a function to do this.
 
 
 ```{r bootstrap_meta}
-bs_meta <- bootstrap_robustness(networkframe, 10) # used 1000 for data in manuscript
+bs_meta <- bootstrap_robustness(networkframe, 100) # used 1000 for data in manuscript
 print(bs_meta)
 ```
 
@@ -757,21 +749,7 @@ micro_completenessframe <- micro_interactions[,c(4:24)]
 
 # again we want to preserve this table
 write.table(micro_completenessframe, "Data/MicroComplete.txt",sep="\t",row.names=FALSE)
-```
 
-As before, calculate interaction sampling completeness:
-
-```{r micro_completeness1}
-micro_interaction.completeness <- SCw2(micro_completenessframe, species.col="BinomialName")
-micro_completeness <- micro_interaction.completeness[1,3]
-cat("The interaction sampling completeness (microscopy method) = ",micro_completeness,"%")
-
-```
-
-
-Again, we will also want the estimates for each species separately later, so let's prepare that:
-
-```{r micro_completeness2}
 # create a list of smaller dframes, one per species
 micro_dframes <- split(micro_completenessframe, list(micro_completenessframe$BinomialName))  # this creates a list of smaller dframes, one for each level of sample
 summary(micro_dframes)
@@ -779,10 +757,9 @@ summary(micro_dframes)
 micro_dframes[9]
 ```
 
+Callum's custom function for calculating interaction completeness should still be loaded from above. Run this function across the list. We only have one column in the matrix (BinomialName) and we don't want a lower threshold so we don't need to specify these.
 
-We earlier loaded up a custom function for calculating interaction completeness. Now run this function across the list. We only have one column in the matrix (BinomialName) and we don't want a lower threshold so we don't need to specify these.
-
-```{r micro_completeness3}
+```{r micro_completeness}
 micro_interaction.completeness <- lapply(micro_dframes, interaction.complete)
 ```
 
@@ -809,7 +786,14 @@ micro_ICgood <- micro_ICmerge[ which( ! micro_ICmerge$completeness %in% "NaN") ,
 
 summary(micro_ICgood$completeness)
 
+# calculate the network completeness - this is the weighted mean interaction sampling completeness of each species in the network, weighted by the estimated interaction richness to give more attention to more generalist species
+
+micro_completeness <- weighted.mean(micro_ICgood$completeness, micro_ICgood$chao, na.rm=T)
+
+cat("The interaction sampling completeness (microscopy method) = ",micro_completeness,"%")
+
 ```
+
 
 
 ### Build a network
@@ -852,9 +836,11 @@ colnames(micro_results) <- "Microscopy"                   # sets the colname as 
 Bootstrap those metrics.
 
 ```{r bootstrap_micro}
-bs_micro <- bootstrap_robustness(micro_networkframe, 10) # used 1000 for data in manuscript
+bs_micro <- bootstrap_robustness(micro_networkframe, 100) # used 1000 for data in manuscript
 print(bs_micro)
 ```
+
+
 
 We now have a web and some network metrics for the microscopy data - hooray! Let's now compare them directly to the metabarcoding metrics.
 
@@ -903,7 +889,6 @@ polls_compare$more <- factor(ifelse(polls_compare$method!="Both","pass",
                                                   ifelse(polls_compare$meta.Species==polls_compare$micro.Species,"Equal","Fail")))))
 summary(polls_compare$more)
 ```
-
 
 
 
@@ -1136,6 +1121,23 @@ drop1(model3nb, test="Chi")
 chkres(model3nb, merged$Method, merged$Treatment)
 ```
 
+If anything, these are worse. Probably a better approach is to use a zero-inflation model.
+
+```{r model3zip}
+# zero-inflated poisson
+model3ZIP <- glmmadmb(IndividualInteractionRichness ~  Method + Treatment
+                      + (1|TrapID),
+                      zeroInflation=TRUE,
+                      family = "poisson",
+                      data = merged)
+
+summary(model3ZIP)
+
+Anova(model3ZIP, type="III")
+
+ chkres.zi(model3ZIP, merged$Method, merged$Treatment) # these aren't great either
+
+```
 
 Try Quasi-poisson
 
@@ -1252,6 +1254,22 @@ summary(model3QPP)
 Anova(model3QPP, type="III")
 
 chkres.PQL(model3QPP, mergeP$Method, mergeP$Treatment)
+```
+
+```{r model3zip1}
+# zero-inflated poisson
+model3ZIPP <- glmmadmb(IndividualInteractionRichness ~  Method + Treatment
+                      + (1|TrapID),
+                      zeroInflation=TRUE,
+                      family = "poisson",
+                      data = mergeP)
+
+summary(model3ZIPP)
+
+Anova(model3ZIPP, type="III")
+
+ chkres.zi(model3ZIPP, mergeP$Method, mergeP$Treatment) # these aren't great either
+
 ```
 
 All methods produce roughly comparable residuals so we should go with the simplest, most theoretically-appropriate model, which is Poisson.
@@ -1757,9 +1775,22 @@ g6
 multiplot(g1,g3,g2,g4,g5,g6,cols=2)
 m1 <- grid.arrange(g1,g4,g3,g5,g2,g6, ncol=2,nrow=3)
 
-#ggsave("Fig2multiupdate.svg", plot = m1, device = "svg", path = "Plots/", width = 29, height = 34, units = "cm")
+ggsave("Fig2multiupdate.svg", plot = m1, device = "svg", path = "Plots/", width = 29, height = 34, units = "cm")
 
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1844,7 +1875,7 @@ dframes_fam[9]
 ```
 
 
-Calculate interaction completeness for each species in the network.
+We earlier loaded up a custom function for calculating interaction completeness. Now run this function across the list. We only have one column in the matrix (BinomialName) and we don't want a lower threshold so we don't need to specify these.
 
 ```{r completeness}
 interaction.completeness_fam <- lapply(dframes_fam, interaction.complete)
@@ -1917,7 +1948,7 @@ colnames(results_fam) <- "Metabarcoding"                   # sets the colname as
 Bootstrap those metrics.
 
 ```{r bootstrap_meta_fam}
-bs_meta_fam <- bootstrap_robustness(networkframe_fam, 10) # used 1000 for data in manuscript
+bs_meta_fam <- bootstrap_robustness(networkframe_fam, 100) # used 1000 for data in manuscript
 print(bs_meta_fam)
 ```
 
@@ -2066,7 +2097,7 @@ colnames(micro_results_fam) <- "Microscopy"                   # sets the colname
 Bootstrap those metrics.
 
 ```{r bootstrap_micro_fam}
-bs_micro_fam <- bootstrap_robustness(micro_networkframe_fam, 10) # used 1000 for data in manuscript
+bs_micro_fam <- bootstrap_robustness(micro_networkframe_fam, 100) # used 1000 for data in manuscript
 print(bs_micro_fam)
 ```
 
@@ -2649,7 +2680,7 @@ g2.3 <- ggplot(metricsframe,
   geom_line(aes(linetype=factor(Level)),
     colour="black",stat="identity",size=1)+
   scale_y_continuous(limits = c(0,10))+
-  xlab("")+  ylab(" \nGenerality")+
+  xlab("")+  ylab(" \nGenerality of pollinators")+
   theme(panel.background=element_rect(fill="white"),
         panel.grid.major.x=element_blank(),
         panel.grid.major.y=element_line(colour="gray70"),
@@ -2675,7 +2706,7 @@ g2.4 <- ggplot(metricsframe,
   geom_line(aes(linetype=factor(Level)),
     colour="black",stat="identity",size=1)+
   scale_y_continuous(limits = c(0,10))+
-  xlab("")+  ylab(" \nVulnerability")+
+  xlab("")+  ylab(" \nGenerality of plants")+
   theme(panel.background=element_rect(fill="white"),
         panel.grid.major.x=element_blank(),
         panel.grid.major.y=element_line(colour="gray70"),
@@ -2765,8 +2796,9 @@ g2.6
 Stitch them together in a multiplot.
 
 ```{r multinetwork}
-multiplot(g2.1,g2.3,g2.5,g2.2,g2.4,g2.6,cols=2)
+m2 <- grid.arrange(g2.1,g2.2,g2.3,g2.4,g2.5,g2.6,ncol=2)
 
+ggsave("Fig3.svg", plot = m2, device = "svg", path = "Plots", width = 290, height = 320, units = "mm")
 ```
 
 
